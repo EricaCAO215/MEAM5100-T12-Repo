@@ -1,3 +1,7 @@
+//-------------------------------------------------------------------//
+// Parameter: Kp = 3.5, Ki = , Kd = 1.18,
+
+
 #include <WiFi.h>
 #include <WebServer.h> // Library for Web Server
 #include <esp32-hal-ledc.h>
@@ -6,8 +10,8 @@
 // ==========================================================
 // ==== Wi-Fi (AP Mode Configuration)
 // ==========================================================
-const char* AP_SSID = "ESP32_PID_DASHBOARD";
-const char* AP_PASS = "123456789"; // 密码必须至少8个字符
+const char* AP_SSID = "ESP32_PID_CHART"; 
+const char* AP_PASS = "123456789"; 
 IPAddress AP_IP(192, 168, 4, 1);
 // ==========================================================
 // ==== Hardware Pins & PWM Parameters ====
@@ -23,38 +27,31 @@ const int PWM_BITS = 8;       // Resolution (8-bit = 0-255 range)
 // ==========================================================
 // ==== PID 闭环控制 (Lab 4.2.2) ====
 // ==========================================================
-// --- PID 增益 (Tuning) ---
 float KP = 3.0; 
 float KI = 0.5; 
 float KD = 0.1; 
 
-// --- PID 状态变量 ---
 float summederror = 0;
 float last_error = 0;
 
-// --- PID 采样时间 ---
-const long PID_SAMPLE_TIME_MS = 50; // 每 50ms 运行一次 PID 计算
+const long PID_SAMPLE_TIME_MS = 50; 
 unsigned long last_pid_time = 0;
 
-// --- 速度和设定值变量 ---
-// DesiredSpeed_Setpoint (来自滑块) 现在表示 (counts / second)
 int DesiredSpeed_Setpoint = 0; 
-// MeasuredVelocity_CountsPerSec 是编码器测得的速度 (counts / second)
 float MeasuredVelocity_CountsPerSec = 0; 
 
 // ==========================================================
 // ==== 实时数据显示的全局变量 ====
 // ==========================================================
-// 这些变量将被 loop() 更新, 并被 handleGetData() 读取
 float g_current_error = 0;
 int   g_current_pwm_output = 0;
 
 // ==========================================================
 // ==== Encoder / Counter Variables (Lab 4.1.5) ====
 // ==========================================================
-volatile long EncoderCounts = 0; // 总脉冲计数
-volatile long last_counts = 0;   // 上一个 PID 周期的脉冲计数
-volatile int motorDirection = 0; // Motor direction (+1: FWD, -1: REV, 0: STOP)
+volatile long EncoderCounts = 0; 
+volatile long last_counts = 0;   
+volatile int motorDirection = 0; 
 
 // ==========================================================
 // ==== Interrupt Service Routine (ISR) ====
@@ -66,7 +63,7 @@ void IRAM_ATTR isr_encoder() {
 // ==========================================================
 // ==== Web Server HTML and Control Functions ====
 // ==========================================================
-WebServer server(80); // Create server on standard HTTP port 80
+WebServer server(80); 
 
 void handleRoot() {
   // --- HTML (已更新, 包含 PID 调参表单 和 实时数据 div) ---
@@ -79,15 +76,25 @@ void handleRoot() {
   html += "input[type='number']{width: 80px; font-size: 16px; margin: 5px;}";
   html += "form{margin: 20px auto; width: 80%; padding: 10px; border: 1px solid #555; border-radius: 10px;}";
   html += "input[type='submit']{background-color:#4CAF50; color:white; padding:10px 20px; border:none; border-radius:5px; font-size:16px; cursor:pointer;}";
-  // --- 实时数据容器的样式 ---
   html += "#data-container{width:80%; margin:20px auto; padding:10px; border:1px solid #555; border-radius:10px; text-align:left; font-size:18px; line-height:1.6;}";
   html += "#data-container span{float:right; font-weight:bold; color:#00c2ff;}";
+  // --- SVG 图表样式 ---
+  html += "svg{width:80%; height:120px; background-color:#333; border:1px solid #555; border-radius:10px; margin-top:10px;}";
   html += "</style>";
   html += "</head><body>";
   html += "<h1>PID Motor Control (Lab 4.2.2)</h1>";
   
   // ==========================================================
-  // ==== 实时数据容器 (Live Data Container) ====
+  // ==== 1. 实时 SVG 图表 ====
+  // ==========================================================
+  html += "<h3>Live Chart (Last 5 Sec)</h3>";
+  html += "<svg id='pid-chart' viewBox='0 0 300 100' preserveAspectRatio='none'>";
+  html += "<line id='graph-target' x1='0' y1='50' x2='300' y2='50' style='stroke:#00c2ff; stroke-width:2; stroke-dasharray: 4;' />";
+  html += "<polyline id='graph-measured' points='0,100' style='fill:none; stroke:#4CAF50; stroke-width:2;' />";
+  html += "</svg>";
+  
+  // ==========================================================
+  // ==== 2. 实时数据文本 ====
   // ==========================================================
   html += "<h3>Live Data</h3>";
   html += "<div id='data-container'>";
@@ -105,29 +112,35 @@ void handleRoot() {
   
   // --- 速度控制 ---
   html += "<h3 id='speed-label'>Desired Speed (" + String(DesiredSpeed_Setpoint) + " C/s)</h3>";
-  
-  // ==========================================================
-  // ==== 最终修复: 滑块最大值已设置为 86 ====
-  // ==========================================================
   html += "<input type='range' min='0' max='86' value='" + String(DesiredSpeed_Setpoint) + "' class='slider' id='speedSlider'";
   html += " onchange='setSpeed(this.value)'>";
   
   // --- PID 调参表单 ---
   html += "<h3>PID Tuning</h3>";
   html += "<form onsubmit='updatePID(event)'>";
-  html += "KP: <input type='number' step='0.1' id='kp' value='" + String(KP) + "'><br>";
-  html += "KI: <input type='number' step='0.1' id='ki' value='" + String(KI) + "'><br>";
-  html += "KD: <input type='number' step='0.1' id='kd' value='" + String(KD) + "'><br>";
+  // ==========================================================
+  // ==== 最终修复: 分辨率已设置为 0.01 ====
+  // ==========================================================
+  html += "KP: <input type='number' step='0.1' id='kp' value='" + String(KP) + "'><br>"; // KP 保持 0.1
+  html += "KI: <input type='number' step='0.01' id='ki' value='" + String(KI) + "'><br>";
+  html += "KD: <input type='number' step='0.01' id='kd' value='" + String(KD) + "'><br>";
   html += "<br><input type='submit' value='Update PID'>";
   html += "</form>";
 
   // --- JavaScript (包含数据轮询) ---
   html += "<script>";
+  // --- JS 变量用于图表 ---
+  html += "const MAX_HISTORY = 50;"; 
+  html += "let historyMeasured = [];";
+  html += "const CHART_WIDTH = 300;"; 
+  html += "const CHART_HEIGHT = 100;"; 
+  html += "const MAX_SPEED = 86.0;"; 
+  
   html += "function sendCommand(cmd){ var xhr = new XMLHttpRequest(); xhr.open('GET', '/' + cmd, true); xhr.send();}";
   html += "function setSpeed(val){ var xhr = new XMLHttpRequest(); xhr.open('GET', '/setSpeed?value=' + val, true); xhr.send(); document.getElementById('speed-label').innerHTML = 'Desired Speed (' + val + ' C/s)';}";
   
   html += "function updatePID(e){";
-  html += "e.preventDefault();"; // 阻止表单提交导致页面刷新
+  html += "e.preventDefault();"; 
   html += "var kp=document.getElementById('kp').value;";
   html += "var ki=document.getElementById('ki').value;";
   html += "var kd=document.getElementById('kd').value;";
@@ -141,21 +154,44 @@ void handleRoot() {
   html += "var xhr=new XMLHttpRequest();";
   html += "xhr.onreadystatechange = function() {";
   html += "if (this.readyState == 4 && this.status == 200) {";
-  html += "var data = JSON.parse(this.responseText);"; // 解析 ESP32 发来的 JSON
-  // 更新 HTML 页面上的值
+  html += "var data = JSON.parse(this.responseText);"; 
+  // 1. 更新文本数据
   html += "document.getElementById('target-val').innerHTML = data.target;";
-  html += "document.getElementById('measured-val').innerHTML = data.measured.toFixed(1);"; // 保留1位小数
-  html += "document.getElementById('error-val').innerHTML = data.error.toFixed(1);"; // 保留1位小数
+  html += "document.getElementById('measured-val').innerHTML = data.measured.toFixed(1);"; 
+  html += "document.getElementById('error-val').innerHTML = data.error.toFixed(1);"; 
   html += "document.getElementById('pwm-val').innerHTML = data.pwm;";
+  // 2. 更新图表
+  html += "updateGraph(data.measured, data.target);";
   html += "}";
   html += "};";
   html += "xhr.open('GET', '/getData', true);";
   html += "xhr.send();";
   html += "}";
   
-  // ==========================================================
-  // ==== 最终修复: 刷新间隔已设置为 100ms ====
-  // ==========================================================
+  // --- updateGraph() JavaScript 函数 ---
+  html += "function updateGraph(measuredVal, targetVal) {";
+  html += "historyMeasured.push(measuredVal);";
+  html += "if (historyMeasured.length > MAX_HISTORY) { historyMeasured.shift(); }";
+  
+  // --- 绘制 Target (蓝色虚线) ---
+  html += "var y_target = CHART_HEIGHT - (targetVal / MAX_SPEED) * CHART_HEIGHT;";
+  html += "if (y_target < 0) y_target = 0; if (y_target > CHART_HEIGHT) y_target = CHART_HEIGHT;";
+  html += "var targetLine = document.getElementById('graph-target');";
+  html += "targetLine.setAttribute('y1', y_target);";
+  html += "targetLine.setAttribute('y2', y_target);";
+  
+  // --- 绘制 Measured (绿色折线) ---
+  html += "var points = '';"; 
+  html += "for (var i = 0; i < historyMeasured.length; i++) {";
+  html += "var x = (i / (MAX_HISTORY - 1)) * CHART_WIDTH;";
+  html += "var y = CHART_HEIGHT - (historyMeasured[i] / MAX_SPEED) * CHART_HEIGHT;";
+  html += "if (y < 0) y = 0; if (y > CHART_HEIGHT) y = CHART_HEIGHT;";
+  html += "points += x + ',' + y + ' ';"; 
+  html += "}";
+  html += "document.getElementById('graph-measured').setAttribute('points', points);";
+  html += "}"; 
+  
+  // 刷新间隔已设置为 100ms
   html += "setInterval(getData, 100);"; 
   html += "</script>";
   
@@ -223,7 +259,6 @@ void handleSetPID() {
 // ==========================================================
 void handleGetData() {
   // 创建一个 JSON 字符串
-  // 格式: {"target": 50, "measured": 48.5, "error": 1.5, "pwm": 120}
   String json = "{";
   json += "\"target\": " + String(DesiredSpeed_Setpoint);
   json += ", \"measured\": " + String(MeasuredVelocity_CountsPerSec, 1); // 1位小数
@@ -268,8 +303,8 @@ void setup() {
   server.on("/backward", handleBackward);
   server.on("/stop", handleStop);
   server.on("/setSpeed", handleSetSpeed);
-  server.on("/setPID", handleSetPID);     // (用于 PID 调参)
-  server.on("/getData", handleGetData); // (用于实时数据轮询)
+  server.on("/setPID", handleSetPID);     
+  server.on("/getData", handleGetData); 
   
   server.begin(); // 服务器启动
   Serial.println("Web server started! Connect to AP and visit http://192.168.4.1");
