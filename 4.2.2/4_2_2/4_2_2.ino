@@ -152,8 +152,11 @@ void handleRoot() {
   html += "xhr.open('GET', '/getData', true);";
   html += "xhr.send();";
   html += "}";
-  // --- 启动定时器: 每 500ms 自动调用一次 getData() ---
-  html += "setInterval(getData, 500);"; 
+  
+  // ==========================================================
+  // ==== 最终修复: 刷新间隔已设置为 100ms ====
+  // ==========================================================
+  html += "setInterval(getData, 100);"; 
   html += "</script>";
   
   html += "</body></html>";
