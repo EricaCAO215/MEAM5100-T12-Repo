@@ -11,7 +11,7 @@ IPAddress AP_IP(192,168,4,1);
 // ========== Pins / PWM (L298N) ==========
 const int SPEED_PIN_L = 18;   // ENA
 const int DIR_PIN_1   = 19;   // IN1
-const int DIR_PIN_2   = 6;   // IN2  ← 修正为 G6
+const int DIR_PIN_2   = 6;    // IN2  G20/G10都有问题，换成G6好了
 const int ENCODER_PIN_L = 1;  // 编码器 L
 
 const int SPEED_PIN_R = 7;    // ENB
@@ -32,7 +32,11 @@ float summederror_R=0, last_error_R=0;
 const long PID_SAMPLE_TIME_MS = 50;
 unsigned long last_pid_time = 0;
 
-int   DesiredSpeed_Setpoint = 0;
+// —— 目标速度（左右独立），以及“基础速度”（供旧网页展示与 /steer 使用）——
+int   DesiredSpeed_Setpoint_L = 0;
+int   DesiredSpeed_Setpoint_R = 0;
+int   BaseSpeed_Setpoint      = 0;
+
 float MeasuredVelocity_CountsPerSec_L = 0;
 float MeasuredVelocity_CountsPerSec_R = 0;
 
@@ -45,7 +49,7 @@ volatile long EncoderCounts_R = 0;
 long last_counts_L = 0;
 long last_counts_R = 0;
 
-int  motorDirection_L = 0; // 0 停, ±1 表示方向，仅用于是否控制
+int  motorDirection_L = 0; // 0 停, ±1 表示方向
 int  motorDirection_R = 0;
 
 int  prevL = HIGH, prevR = HIGH;      // 上一次电平
@@ -55,8 +59,20 @@ const unsigned long DEBOUNCE_US = 200; // 轻度消抖
 // ========== Web ==========
 WebServer server(80);
 
-void handleRoot(); void handleForward(); void handleBackward();
-void handleStop(); void handleSetSpeed(); void handleSetPID(); void handleGetData();
+// 声明
+void handleRoot();
+void handleForward();
+void handleBackward();
+void handleStop();
+void handleSetSpeed();
+void handleSetPID();
+void handleGetData();
+// 新增
+void handleSetSpeedLR();   // /setSpeedLR?l=..&r=..
+void handleSteer();        // /steer?delta=-100..100
+void handlePivot();        // /pivot?dir=left|right&spd=..
+
+static inline int clamp255(float x){ if (x<0) return 0; if (x>255) return 255; return (int)x; }
 
 void setup() {
   Serial.begin(115200);
@@ -98,21 +114,26 @@ void setup() {
   server.on("/forward", handleForward);
   server.on("/backward", handleBackward);
   server.on("/stop", handleStop);
-  server.on("/setSpeed", handleSetSpeed);
+  server.on("/setSpeed", handleSetSpeed);       // 同时设置左右=基础速度
   server.on("/setPID", handleSetPID);
   server.on("/getData", handleGetData);
-  server.begin();
 
+  // 新增：转弯控制接口（网页不变，但可直接用 URL 调）
+  server.on("/setSpeedLR", handleSetSpeedLR);   // 左右独立设速
+  server.on("/steer", handleSteer);             // 差速转向（基于 BaseSpeed_Setpoint）
+  server.on("/pivot", handlePivot);             // 原地掉头
+
+  server.begin();
   last_pid_time = millis();
 }
 
 // ======== 轮询编码器：检测上升沿并计数 ========
 inline void pollEncoders() {
   int curL = digitalRead(ENCODER_PIN_L);
-  if (prevL == LOW && curL == HIGH) {           // 上升沿
+  if (prevL == LOW && curL == HIGH) {
     unsigned long now = micros();
     if (now - lastEdgeUsL > DEBOUNCE_US) {
-      EncoderCounts_L++;                        // 只计数，不带符号
+      EncoderCounts_L++;
       lastEdgeUsL = now;
     }
   }
@@ -131,14 +152,11 @@ inline void pollEncoders() {
 
 void loop() {
   server.handleClient();
-
-  // 高频轮询编码器（尽量每次 loop 都跑）
   pollEncoders();
 
-  // 每 50ms 做一次速度估计 + PID
   if (millis() - last_pid_time < PID_SAMPLE_TIME_MS) return;
 
-  noInterrupts(); // 这里不再有中断，但为确保与 pollEncoders 的一致性可短暂关一次
+  noInterrupts();
   long current_counts_L = EncoderCounts_L;
   long current_counts_R = EncoderCounts_R;
   interrupts();
@@ -152,34 +170,30 @@ void loop() {
   int pwm_output_L = 0, pwm_output_R = 0;
   float LARGE_SUM = 2000.0;
 
-  // 左轮
+  // 左轮 PID
   if (motorDirection_L == 0) {
     pwm_output_L = 0; summederror_L = 0; last_error_L = 0; g_current_error_L = 0;
   } else {
-    float error_L = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_L;
+    float error_L = (float)DesiredSpeed_Setpoint_L - MeasuredVelocity_CountsPerSec_L;
     g_current_error_L = error_L;
     summederror_L += error_L;
     if (summederror_L >  LARGE_SUM) summederror_L =  LARGE_SUM;
     if (summederror_L < -LARGE_SUM) summederror_L = -LARGE_SUM;
     float dL = error_L - last_error_L; last_error_L = error_L;
-    float outL = KP_L*error_L + KI_L*summederror_L + KD_L*dL;
-    if (outL < 0) outL = 0; if (outL > 255) outL = 255;
-    pwm_output_L = (int)outL;
+    pwm_output_L = clamp255(KP_L*error_L + KI_L*summederror_L + KD_L*dL);
   }
 
-  // 右轮
+  // 右轮 PID
   if (motorDirection_R == 0) {
     pwm_output_R = 0; summederror_R = 0; last_error_R = 0; g_current_error_R = 0;
   } else {
-    float error_R = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_R;
+    float error_R = (float)DesiredSpeed_Setpoint_R - MeasuredVelocity_CountsPerSec_R;
     g_current_error_R = error_R;
     summederror_R += error_R;
     if (summederror_R >  LARGE_SUM) summederror_R =  LARGE_SUM;
     if (summederror_R < -LARGE_SUM) summederror_R = -LARGE_SUM;
     float dR = error_R - last_error_R; last_error_R = error_R;
-    float outR = KP_R*error_R + KI_R*summederror_R + KD_R*dR;
-    if (outR < 0) outR = 0; if (outR > 255) outR = 255;
-    pwm_output_R = (int)outR;
+    pwm_output_R = clamp255(KP_R*error_R + KI_R*summederror_R + KD_R*dR);
   }
 
   g_current_pwm_output_L = pwm_output_L;
@@ -187,37 +201,132 @@ void loop() {
   ledcWrite(SPEED_PIN_L, g_current_pwm_output_L);
   ledcWrite(SPEED_PIN_R, g_current_pwm_output_R);
 
-  Serial.printf("L: T:%d M:%.1f E:%.1f P:%d | R: T:%d M:%.1f E:%.1f P:%d\n",
-    DesiredSpeed_Setpoint, MeasuredVelocity_CountsPerSec_L, g_current_error_L, g_current_pwm_output_L,
-    DesiredSpeed_Setpoint, MeasuredVelocity_CountsPerSec_R, g_current_error_R, g_current_pwm_output_R);
+  Serial.printf("L: TL:%d M:%.1f E:%.1f P:%d | R: TR:%d M:%.1f E:%.1f P:%d\n",
+    DesiredSpeed_Setpoint_L, MeasuredVelocity_CountsPerSec_L, g_current_error_L, g_current_pwm_output_L,
+    DesiredSpeed_Setpoint_R, MeasuredVelocity_CountsPerSec_R, g_current_error_R, g_current_pwm_output_R);
 
   last_pid_time = millis();
 }
 
-// ========== HTTP handlers（原样保留）==========
-void handleRoot() { /* ……你原来的 HTML/JS …… */ server.send(200,"text/html",""); } // 这里省略：请用你现有的 handleRoot 内容
+// =================== Web Handlers ===================
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Dual PID Control</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial; text-align:center; background-color:#222; color:white;}";
+  html += ".btn{display:block; width:80%; margin:10px auto; padding:20px; font-size:24px; color:black; background-color:#00c2ff; text-decoration:none; border-radius:10px; cursor:pointer;}";
+  html += ".stop{background-color:#ff4f4f;}";
+  html += ".slider{width:80%; margin:20px auto;}";
+  html += "input[type='number']{width: 80px; font-size: 16px; margin: 5px;}";
+  html += "form{margin: 20px auto; width: 90%; padding: 10px; border: 1px solid #555; border-radius: 10px;}";
+  html += "form div{display:inline-block; width:48%; vertical-align:top; box-sizing: border-box;}";
+  html += "input[type='submit']{background-color:#4CAF50; color:white; padding:10px 20px; border:none; border-radius:5px; font-size:16px; cursor:pointer; margin-top:10px;}";
+  html += "#data-container{width:80%; margin:20px auto; padding:10px; border:1px solid #555; border-radius:10px; text-align:left; font-size:18px; line-height:1.6;}";
+  html += "#data-container span{float:right; font-weight:bold; color:#00c2ff;}";
+  html += "svg{width:80%; height:120px; background-color:#333; border:1px solid #555; border-radius:10px; margin-top:10px;}";
+  html += ".turn-section{margin-top:30px;}";
+  html += ".turn-btn{display:inline-block; width:38%; margin:5px; padding:15px; font-size:18px; color:black; background-color:#ffaa00; border:none; border-radius:10px; cursor:pointer;}";
+  html += "</style></head><body>";
+  html += "<h1>Dual PID Motor Control (L298N)</h1>";
+
+  // --- 实时图表 ---
+  html += "<h3>Live Chart (Last 5 Sec)</h3>";
+  html += "<svg id='pid-chart' viewBox='0 0 300 100' preserveAspectRatio='none'>";
+  html += "<line id='graph-target' x1='0' y1='50' x2='300' y2='50' style='stroke:#00c2ff; stroke-width:2; stroke-dasharray: 4;' />";
+  html += "<polyline id='graph-measured-l' points='0,100' style='fill:none; stroke:#4CAF50; stroke-width:2;' />";
+  html += "<polyline id='graph-measured-r' points='0,100' style='fill:none; stroke:#FF6347; stroke-width:2;' />";
+  html += "</svg>";
+
+  // --- 实时数据 ---
+  html += "<h3>Live Data</h3>";
+  html += "<div id='data-container'>";
+  html += "Target: <span id='target-val'>0</span> C/s<br><hr style='border-color:#444;'>";
+  html += "Measured (L - G1): <span id='measured-l-val'>0.0</span> C/s<br>";
+  html += "Error (L): <span id='error-l-val'>0.0</span><br>";
+  html += "PWM (L): <span id='pwm-l-val'>0</span><br><hr style='border-color:#444;'>";
+  html += "Measured (R - G0): <span id='measured-r-val'>0.0</span> C/s<br>";
+  html += "Error (R): <span id='error-r-val'>0.0</span><br>";
+  html += "PWM (R): <span id='pwm-r-val'>0</span></div>";
+
+  // --- 方向控制 ---
+  html += "<h3>Direction</h3>";
+  html += "<button class='btn' onclick=\"sendCommand('forward')\">FORWARD</button>";
+  html += "<button class='btn' onclick=\"sendCommand('backward')\">BACKWARD</button>";
+  html += "<button class='btn stop' onclick=\"sendCommand('stop')\">STOP</button>";
+
+  // --- 速度控制 ---
+  html += "<h3 id='speed-label'>Desired Speed (0 C/s)</h3>";
+  html += "<input type='range' min='0' max='200' value='0' class='slider' id='speedSlider' onchange='setSpeed(this.value)'>";
+
+  // --- PID 调参 ---
+  html += "<h3>PID Tuning (Independent)</h3>";
+  html += "<form onsubmit='updatePID(event)'>";
+  html += "<div><b>Left Motor (G1)</b><br>";
+  html += "KP (L): <input type='number' step='0.1' id='kp_l' value='3.0'><br>";
+  html += "KI (L): <input type='number' step='0.01' id='ki_l' value='0.0'><br>";
+  html += "KD (L): <input type='number' step='0.01' id='kd_l' value='0.1'><br></div>";
+  html += "<div><b>Right Motor (G0)</b><br>";
+  html += "KP (R): <input type='number' step='0.1' id='kp_r' value='3.0'><br>";
+  html += "KI (R): <input type='number' step='0.01' id='ki_r' value='0.0'><br>";
+  html += "KD (R): <input type='number' step='0.01' id='kd_r' value='0.1'><br></div>";
+  html += "<br><br><input type='submit' value='Update All PID'></form>";
+
+  // --- 转向控制区 ---   注意turn left/right逻辑有点问题，强行互换就正常了
+  html += "<div class='turn-section'><h3>Turning Control</h3>";
+  html += "<button class='turn-btn' onclick=\"turnRight()\">Steer Left</button>";
+  html += "<button class='turn-btn' onclick=\"turnLeft()\">Steer Right</button><br>";
+  html += "<button class='turn-btn' onclick=\"pivotLeft()\">Pivot Left</button>";
+  html += "<button class='turn-btn' onclick=\"pivotRight()\">Pivot Right</button></div>";
+
+  // --- JavaScript ---
+  html += "<script>";
+  html += "const MAX_HISTORY=50,CHART_WIDTH=300,CHART_HEIGHT=100,MAX_SPEED=200.0;";
+  html += "let hL=[],hR=[];";
+  html += "function sendCommand(cmd){var x=new XMLHttpRequest();x.open('GET','/'+cmd,true);x.send();}";
+  html += "function setSpeed(v){var x=new XMLHttpRequest();x.open('GET','/setSpeed?value='+v,true);x.send();document.getElementById('speed-label').innerHTML='Desired Speed ('+v+' C/s)';}";
+  html += "function updatePID(e){e.preventDefault();var kp_l=kp_l.value,ki_l=ki_l.value,kd_l=kd_l.value,kp_r=kp_r.value,ki_r=ki_r.value,kd_r=kd_r.value;var x=new XMLHttpRequest();x.open('GET','/setPID?kp_l='+kp_l+'&ki_l='+ki_l+'&kd_l='+kd_l+'&kp_r='+kp_r+'&ki_r='+ki_r+'&kd_r='+kd_r,true);x.send();}";
+  html += "function getData(){var x=new XMLHttpRequest();x.onreadystatechange=function(){if(this.readyState==4&&this.status==200){var d=JSON.parse(this.responseText);document.getElementById('target-val').innerHTML=d.target;document.getElementById('measured-l-val').innerHTML=d.measured_l.toFixed(1);document.getElementById('error-l-val').innerHTML=d.error_l.toFixed(1);document.getElementById('pwm-l-val').innerHTML=d.pwm_l;document.getElementById('measured-r-val').innerHTML=d.measured_r.toFixed(1);document.getElementById('error-r-val').innerHTML=d.error_r.toFixed(1);document.getElementById('pwm-r-val').innerHTML=d.pwm_r;updateGraph(d.measured_l,d.measured_r,d.target);}};x.open('GET','/getData',true);x.send();}";
+  html += "function updateGraph(vL,vR,t){hL.push(vL);hR.push(vR);if(hL.length>MAX_HISTORY)hL.shift();if(hR.length>MAX_HISTORY)hR.shift();var yT=CHART_HEIGHT-(t/MAX_SPEED)*CHART_HEIGHT;if(yT<0)yT=0;if(yT>CHART_HEIGHT)yT=CHART_HEIGHT;var tl=document.getElementById('graph-target');tl.setAttribute('y1',yT);tl.setAttribute('y2',yT);var pL='',pR='';for(var i=0;i<hL.length;i++){var x=(i/(MAX_HISTORY-1))*CHART_WIDTH;var yL=CHART_HEIGHT-(hL[i]/MAX_SPEED)*CHART_HEIGHT;if(yL<0)yL=0;if(yL>CHART_HEIGHT)yL=CHART_HEIGHT;pL+=x+','+yL+' ';if(i<hR.length){var yR=CHART_HEIGHT-(hR[i]/MAX_SPEED)*CHART_HEIGHT;if(yR<0)yR=0;if(yR>CHART_HEIGHT)yR=CHART_HEIGHT;pR+=x+','+yR+' ';}}document.getElementById('graph-measured-l').setAttribute('points',pL);document.getElementById('graph-measured-r').setAttribute('points',pR);}";
+  html += "function turnLeft(){var x=new XMLHttpRequest();x.open('GET','/steer?delta=-50',true);x.send();}";
+  html += "function turnRight(){var x=new XMLHttpRequest();x.open('GET','/steer?delta=50',true);x.send();}";
+  html += "function pivotLeft(){var x=new XMLHttpRequest();x.open('GET','/pivot?dir=left&spd=100',true);x.send();}";
+  html += "function pivotRight(){var x=new XMLHttpRequest();x.open('GET','/pivot?dir=right&spd=100',true);x.send();}";
+  html += "setInterval(getData,100);</script></body></html>";
+  server.send(200,"text/html",html);
+}
+
+// 前进：方向同向，速度保持当前基准
 void handleForward(){
-  digitalWrite(DIR_PIN_1, HIGH);  // IN1=1
-  digitalWrite(DIR_PIN_2, LOW);   // IN2=0  → 正转
-  digitalWrite(DIR_PIN_3, HIGH);
+  digitalWrite(DIR_PIN_1, HIGH);  // 左：正转
+  digitalWrite(DIR_PIN_2, LOW);
+  digitalWrite(DIR_PIN_3, HIGH);  // 右：正转
   digitalWrite(DIR_PIN_4, LOW);
   motorDirection_L = 1;
   motorDirection_R = 1;
+  // 用当前基准速度更新左右目标
+  DesiredSpeed_Setpoint_L = BaseSpeed_Setpoint;
+  DesiredSpeed_Setpoint_R = BaseSpeed_Setpoint;
   summederror_L = summederror_R = 0;
   last_error_L = last_error_R = 0;
   server.send(200,"text/plain","OK - Forward");
 }
+
+// 后退：方向同向
 void handleBackward(){
-  digitalWrite(DIR_PIN_1, LOW);   // IN1=0
-  digitalWrite(DIR_PIN_2, HIGH);  // IN2=1  → 反转
-  digitalWrite(DIR_PIN_3, LOW);
+  digitalWrite(DIR_PIN_1, LOW);   // 左：反转
+  digitalWrite(DIR_PIN_2, HIGH);
+  digitalWrite(DIR_PIN_3, LOW);   // 右：反转
   digitalWrite(DIR_PIN_4, HIGH);
   motorDirection_L = -1;
   motorDirection_R = -1;
+  DesiredSpeed_Setpoint_L = BaseSpeed_Setpoint;
+  DesiredSpeed_Setpoint_R = BaseSpeed_Setpoint;
   summederror_L = summederror_R = 0;
   last_error_L = last_error_R = 0;
   server.send(200,"text/plain","OK - Backward");
 }
+
+// 停车：快速制动 + 清零目标
 void handleStop(){
   digitalWrite(DIR_PIN_1, LOW);
   digitalWrite(DIR_PIN_2, LOW);
@@ -225,16 +334,91 @@ void handleStop(){
   digitalWrite(DIR_PIN_4, LOW);
   motorDirection_L = 0;
   motorDirection_R = 0;
-  DesiredSpeed_Setpoint = 0;
+  DesiredSpeed_Setpoint_L = 0;
+  DesiredSpeed_Setpoint_R = 0;
+  BaseSpeed_Setpoint = 0;
   summederror_L = summederror_R = 0;
   last_error_L = last_error_R = 0;
   server.send(200,"text/plain","OK - Stopped");
 }
+
+// 兼容旧接口：同时设置左右目标速度 & 更新基准速度
 void handleSetSpeed(){
   String s = server.arg("value");
-  if (s!="") DesiredSpeed_Setpoint = s.toInt();
+  if (s!="") {
+    int v = s.toInt();
+    if (v < 0) v = 0;
+    BaseSpeed_Setpoint = v;
+    DesiredSpeed_Setpoint_L = v;
+    DesiredSpeed_Setpoint_R = v;
+  }
   server.send(200,"text/plain","OK");
 }
+
+// 新增：左右独立设速 /setSpeedLR?l=..&r=..
+void handleSetSpeedLR(){
+  if (server.hasArg("l")) {
+    long lv = server.arg("l").toInt();   // toInt() -> long
+    if (lv < 0) lv = 0;                  // 下限 0
+    DesiredSpeed_Setpoint_L = (int)lv;   // 存为 int
+  }
+  if (server.hasArg("r")) {
+    long rv = server.arg("r").toInt();
+    if (rv < 0) rv = 0;
+    DesiredSpeed_Setpoint_R = (int)rv;
+  }
+  server.send(200,"text/plain","OK - SpeedLR");
+}
+
+
+// 新增：差速转向 /steer?delta=-100..100
+// 基于 BaseSpeed_Setpoint：L = base*(1 - k), R = base*(1 + k)
+void handleSteer(){
+  int delta = server.hasArg("delta") ? server.arg("delta").toInt() : 0;
+  if (delta > 100) delta = 100;
+  if (delta < -100) delta = -100;
+  float k = delta / 100.0f;
+  int l = (int)(BaseSpeed_Setpoint * (1.0f - k));
+  int r = (int)(BaseSpeed_Setpoint * (1.0f + k));
+  if (l < 0) l = 0; if (r < 0) r = 0;
+  DesiredSpeed_Setpoint_L = l;
+  DesiredSpeed_Setpoint_R = r;
+  server.send(200,"text/plain", "OK - Steer delta=" + String(delta) + " L=" + String(l) + " R=" + String(r));
+}
+
+// 新增：原地掉头 /pivot?dir=left|right&spd=..
+void handlePivot(){
+  String dir = server.arg("dir");
+  int spd = server.hasArg("spd") ? server.arg("spd").toInt() : BaseSpeed_Setpoint;
+  if (spd < 0) spd = 0;
+
+  if (dir == "left") {
+    // 左轮后退、右轮前进
+    digitalWrite(DIR_PIN_1, LOW);
+    digitalWrite(DIR_PIN_2, HIGH);
+    digitalWrite(DIR_PIN_3, HIGH);
+    digitalWrite(DIR_PIN_4, LOW);
+    motorDirection_L = -1;
+    motorDirection_R =  1;
+  } else if (dir == "right") {
+    // 左轮前进、右轮后退
+    digitalWrite(DIR_PIN_1, HIGH);
+    digitalWrite(DIR_PIN_2, LOW);
+    digitalWrite(DIR_PIN_3, LOW);
+    digitalWrite(DIR_PIN_4, HIGH);
+    motorDirection_L =  1;
+    motorDirection_R = -1;
+  } else {
+    server.send(400,"text/plain","usage: /pivot?dir=left|right&spd=0..");
+    return;
+  }
+
+  DesiredSpeed_Setpoint_L = spd;
+  DesiredSpeed_Setpoint_R = spd;
+  server.send(200,"text/plain","OK - Pivot " + dir + " spd=" + String(spd));
+}
+
+// PID 调参
 void handleSetPID(){
   if (server.hasArg("kp_l")) KP_L = server.arg("kp_l").toFloat();
   if (server.hasArg("ki_l")) KI_L = server.arg("ki_l").toFloat();
@@ -246,9 +430,11 @@ void handleSetPID(){
   last_error_L = last_error_R = 0;
   server.send(200,"text/plain","OK - PID Updated");
 }
+
+// 实时数据（保持旧网页字段名）
 void handleGetData(){
   String json = "{";
-  json += "\"target\":" + String(DesiredSpeed_Setpoint);
+  json += "\"target\":" + String(BaseSpeed_Setpoint); // 旧页面显示 target
   json += ",\"measured_l\":" + String(MeasuredVelocity_CountsPerSec_L,1);
   json += ",\"error_l\":" + String(g_current_error_L,1);
   json += ",\"pwm_l\":" + String(g_current_pwm_output_L);
