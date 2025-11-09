@@ -1,37 +1,33 @@
-// ESP32-C3 Dual Motor PID (No interrupts, No PCNT) — Software polling encoders
-// Minimal full sketch for MEAM5100 Lab 4.2.2
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <esp32-hal-ledc.h>
 #include <esp32-hal-adc.h>
 
-// ===================== Wi-Fi (AP) =====================
+// ================= Wi-Fi =================
 const char* AP_SSID = "ESP32_PID_CHART_DUAL";
 const char* AP_PASS = "123456789";
 IPAddress AP_IP(192,168,4,1);
 
-// ===================== Pins & PWM =====================
-// 左电机
-const int SPEED_PIN_L   = 6;   // EN (PWM)
-const int DIR_PIN_1     = 10;  // 1A
-const int DIR_PIN_2     = 8;   // 2A
-const int ENCODER_PIN_L = 1;   // 编码器信号（单通道）
-// 右电机
-const int SPEED_PIN_R   = 7;   // EN (PWM)
-const int DIR_PIN_3     = 4;   // 4A
-const int DIR_PIN_4     = 5;   // 3A
-const int ENCODER_PIN_R = 0;   // 编码器信号（单通道）
+// ========== Pins / PWM (L298N) ==========
+const int SPEED_PIN_L = 18;   // ENA
+const int DIR_PIN_1   = 19;   // IN1
+const int DIR_PIN_2   = 6;   // IN2  ← 修正为 G6
+const int ENCODER_PIN_L = 1;  // 编码器 L
+
+const int SPEED_PIN_R = 7;    // ENB
+const int DIR_PIN_3   = 4;    // IN3
+const int DIR_PIN_4   = 5;    // IN4
+const int ENCODER_PIN_R = 0;  // 编码器 R
 
 const int PWM_FREQ = 250;
 const int PWM_BITS = 8;
 
-// ===================== PID =====================
-float KP_L = 3.0f, KI_L = 0.5f, KD_L = 0.1f;
-float KP_R = 3.0f, KI_R = 0.5f, KD_R = 0.1f;
+// ========== PID ==========
+float KP_L=3.0, KI_L=0.0, KD_L=0.1;
+float KP_R=3.0, KI_R=0.0, KD_R=0.1;
 
-float summederror_L = 0, last_error_L = 0;
-float summederror_R = 0, last_error_R = 0;
+float summederror_L=0, last_error_L=0;
+float summederror_R=0, last_error_R=0;
 
 const long PID_SAMPLE_TIME_MS = 50;
 unsigned long last_pid_time = 0;
@@ -40,195 +36,64 @@ int   DesiredSpeed_Setpoint = 0;
 float MeasuredVelocity_CountsPerSec_L = 0;
 float MeasuredVelocity_CountsPerSec_R = 0;
 
-// ===================== Runtime/State =====================
-float g_current_error_L = 0;
-int   g_current_pwm_output_L = 0;
-float g_current_error_R = 0;
-int   g_current_pwm_output_R = 0;
+float g_current_error_L=0; int g_current_pwm_output_L=0;
+float g_current_error_R=0; int g_current_pwm_output_R=0;
 
-volatile int motorDirection_L = 0; // 1/-1/0
-volatile int motorDirection_R = 0;
+// ====== 纯轮询的编码器变量（无中断）======
+volatile long EncoderCounts_L = 0;
+volatile long EncoderCounts_R = 0;
+long last_counts_L = 0;
+long last_counts_R = 0;
 
-// ===================== Software Encoder (polling) =====================
-// 简单双沿检测：只计上升沿 + 最小间隔抗毛刺（默认 150us）
-const uint32_t ENC_DEGLITCH_US = 150;
+int  motorDirection_L = 0; // 0 停, ±1 表示方向，仅用于是否控制
+int  motorDirection_R = 0;
 
-volatile long swCounts_L = 0;
-volatile long swCounts_R = 0;
-int lastLevel_L = 0;
-int lastLevel_R = 0;
-uint32_t lastEdge_us_L = 0;
-uint32_t lastEdge_us_R = 0;
+int  prevL = HIGH, prevR = HIGH;      // 上一次电平
+unsigned long lastEdgeUsL = 0, lastEdgeUsR = 0;
+const unsigned long DEBOUNCE_US = 200; // 轻度消抖
 
-inline void poll_encoders_fast()
-{
-  int lvlL = digitalRead(ENCODER_PIN_L);
-  if (lvlL == HIGH && lastLevel_L == LOW) {
-    uint32_t t = micros();
-    if (t - lastEdge_us_L > ENC_DEGLITCH_US) {
-      if (motorDirection_L != 0) swCounts_L += 1; // 单通道：仅幅值
-      lastEdge_us_L = t;
-    }
-  }
-  lastLevel_L = lvlL;
-
-  int lvlR = digitalRead(ENCODER_PIN_R);
-  if (lvlR == HIGH && lastLevel_R == LOW) {
-    uint32_t t = micros();
-    if (t - lastEdge_us_R > ENC_DEGLITCH_US) {
-      if (motorDirection_R != 0) swCounts_R += 1;
-      lastEdge_us_R = t;
-    }
-  }
-  lastLevel_R = lvlR;
-}
-
-// ===================== Web Server =====================
+// ========== Web ==========
 WebServer server(80);
 
-void handleRoot() {
-  String html = "<!DOCTYPE html><html><head><title>ESP32 Dual PID Control</title>";
-  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
-  html += "<style>body{font-family:Arial; text-align:center; background:#222; color:#fff}";
-  html += ".btn{display:block; width:80%; margin:10px auto; padding:20px; font-size:24px; color:#000; background:#00c2ff; border-radius:10px; text-decoration:none}";
-  html += ".stop{background:#ff4f4f}.slider{width:80%; margin:20px auto}";
-  html += "input[type=number]{width:80px; font-size:16px; margin:5px}";
-  html += "form{margin:20px auto; width:90%; padding:10px; border:1px solid #555; border-radius:10px}";
-  html += "form div{display:inline-block; width:48%; vertical-align:top; box-sizing:border-box}";
-  html += "input[type=submit]{background:#4CAF50; color:#fff; padding:10px 20px; border:none; border-radius:5px; font-size:16px; margin-top:10px}";
-  html += "#data-container{width:80%; margin:20px auto; padding:10px; border:1px solid #555; border-radius:10px; text-align:left; font-size:18px; line-height:1.6}";
-  html += "#data-container span{float:right; font-weight:bold; color:#00c2ff}";
-  html += "svg{width:80%; height:120px; background:#333; border:1px solid #555; border-radius:10px; margin-top:10px}";
-  html += "</style></head><body>";
+void handleRoot(); void handleForward(); void handleBackward();
+void handleStop(); void handleSetSpeed(); void handleSetPID(); void handleGetData();
 
-  html += "<h1>Dual PID Motor Control (Polling, no interrupts)</h1>";
-  html += "<h3>Live Chart (Last 5 Sec)</h3>";
-  html += "<svg id='pid-chart' viewBox='0 0 300 100' preserveAspectRatio='none'>";
-  html += "<line id='graph-target' x1='0' y1='50' x2='300' y2='50' style='stroke:#00c2ff;stroke-width:2;stroke-dasharray:4'/>";
-  html += "<polyline id='graph-measured-l' points='0,100' style='fill:none;stroke:#4CAF50;stroke-width:2'/>";
-  html += "<polyline id='graph-measured-r' points='0,100' style='fill:none;stroke:#FF6347;stroke-width:2'/>";
-  html += "</svg>";
-
-  html += "<h3>Live Data</h3><div id='data-container'>";
-  html += "Target: <span id='target-val'>0</span> C/s<br><hr style='border-color:#444'>";
-  html += "Measured (L): <span id='measured-l-val'>0.0</span> C/s<br>";
-  html += "Error (L): <span id='error-l-val'>0.0</span><br>";
-  html += "PWM (L): <span id='pwm-l-val'>0</span><br><hr style='border-color:#444'>";
-  html += "Measured (R): <span id='measured-r-val'>0.0</span> C/s<br>";
-  html += "Error (R): <span id='error-r-val'>0.0</span><br>";
-  html += "PWM (R): <span id='pwm-r-val'>0</span></div>";
-
-  html += "<h3>Direction</h3>";
-  html += "<button class='btn' onclick=\"sendCommand('forward')\">FORWARD</button>";
-  html += "<button class='btn' onclick=\"sendCommand('backward')\">BACKWARD</button>";
-  html += "<button class='btn stop' onclick=\"sendCommand('stop')\">STOP</button>";
-
-  html += "<h3 id='speed-label'>Desired Speed (0 C/s)</h3>";
-  html += "<input type='range' min='0' max='86' value='0' class='slider' id='speedSlider' onchange='setSpeed(this.value)'>";
-
-  html += "<h3>PID Tuning (Independent)</h3>";
-  html += "<form onsubmit='updatePID(event)'>";
-  html += "<div><b>Left Motor</b><br>";
-  html += "KP (L): <input type='number' step='0.1' id='kp_l' value='3.0'><br>";
-  html += "KI (L): <input type='number' step='0.01' id='ki_l' value='0.5'><br>";
-  html += "KD (L): <input type='number' step='0.01' id='kd_l' value='0.1'><br></div>";
-  html += "<div><b>Right Motor</b><br>";
-  html += "KP (R): <input type='number' step='0.1' id='kp_r' value='3.0'><br>";
-  html += "KI (R): <input type='number' step='0.01' id='ki_r' value='0.5'><br>";
-  html += "KD (R): <input type='number' step='0.01' id='kd_r' value='0.1'><br></div>";
-  html += "<br><br><input type='submit' value='Update All PID'></form>";
-
-  html += "<script>";
-  html += "const MAX_HISTORY=50, CHART_WIDTH=300, CHART_HEIGHT=100, MAX_SPEED=86.0;";
-  html += "let histL=[], histR=[];";
-  html += "function sendCommand(c){var x=new XMLHttpRequest();x.open('GET','/'+c,true);x.send();}";
-  html += "function setSpeed(v){var x=new XMLHttpRequest();x.open('GET','/setSpeed?value='+v,true);x.send();document.getElementById('speed-label').innerHTML='Desired Speed ('+v+' C/s)';}";
-  html += "function updatePID(e){e.preventDefault();var kp_l=kp_l.value,ki_l=ki_l.value,kd_l=kd_l.value,kp_r=kp_r.value,ki_r=ki_r.value,kd_r=kd_r.value;var x=new XMLHttpRequest();x.open('GET','/setPID?kp_l='+kp_l+'&ki_l='+ki_l+'&kd_l='+kd_l+'&kp_r='+kp_r+'&ki_r='+ki_r+'&kd_r='+kd_r,true);x.send();}";
-  html += "function getData(){var x=new XMLHttpRequest();x.onreadystatechange=function(){if(this.readyState==4&&this.status==200){var d=JSON.parse(this.responseText);";
-  html += "document.getElementById('target-val').innerHTML=d.target;";
-  html += "document.getElementById('measured-l-val').innerHTML=d.measured_l.toFixed(1);";
-  html += "document.getElementById('error-l-val').innerHTML=d.error_l.toFixed(1);";
-  html += "document.getElementById('pwm-l-val').innerHTML=d.pwm_l;";
-  html += "document.getElementById('measured-r-val').innerHTML=d.measured_r.toFixed(1);";
-  html += "document.getElementById('error-r-val').innerHTML=d.error_r.toFixed(1);";
-  html += "document.getElementById('pwm-r-val').innerHTML=d.pwm_r;updateGraph(d.measured_l,d.measured_r,d.target);}};x.open('GET','/getData',true);x.send();}";
-  html += "function updateGraph(vL,vR,t){histL.push(vL);histR.push(vR);if(histL.length>MAX_HISTORY)histL.shift();if(histR.length>MAX_HISTORY)histR.shift();";
-  html += "var yt=CHART_HEIGHT-(t/MAX_SPEED)*CHART_HEIGHT;yt=Math.max(0,Math.min(CHART_HEIGHT,yt));";
-  html += "document.getElementById('graph-target').setAttribute('y1',yt);document.getElementById('graph-target').setAttribute('y2',yt);";
-  html += "var pL='',pR='';for(var i=0;i<histL.length;i++){var x=(i/(MAX_HISTORY-1))*CHART_WIDTH;var yL=CHART_HEIGHT-(histL[i]/MAX_SPEED)*CHART_HEIGHT;yL=Math.max(0,Math.min(CHART_HEIGHT,yL));pL+=x+','+yL+' ';if(i<histR.length){var yR=CHART_HEIGHT-(histR[i]/MAX_SPEED)*CHART_HEIGHT;yR=Math.max(0,Math.min(CHART_HEIGHT,yR));pR+=x+','+yR+' ';}}";
-  html += "document.getElementById('graph-measured-l').setAttribute('points',pL);document.getElementById('graph-measured-r').setAttribute('points',pR);}setInterval(getData,100);";
-  html += "</script></body></html>";
-  server.send(200,"text/html",html);
-}
-
-void handleForward() {
-  digitalWrite(DIR_PIN_1, LOW);  digitalWrite(DIR_PIN_2, HIGH);  motorDirection_L = 1;  summederror_L = last_error_L = 0;
-  digitalWrite(DIR_PIN_3, LOW);  digitalWrite(DIR_PIN_4, HIGH);  motorDirection_R = 1;  summederror_R = last_error_R = 0;
-  server.send(200,"text/plain","OK - Forward");
-}
-void handleBackward() {
-  digitalWrite(DIR_PIN_1, HIGH); digitalWrite(DIR_PIN_2, LOW);   motorDirection_L = -1; summederror_L = last_error_L = 0;
-  digitalWrite(DIR_PIN_3, HIGH); digitalWrite(DIR_PIN_4, LOW);   motorDirection_R = -1; summederror_R = last_error_R = 0;
-  server.send(200,"text/plain","OK - Backward");
-}
-void handleStop() {
-  motorDirection_L = 0; summederror_L = last_error_L = 0;
-  motorDirection_R = 0; summederror_R = last_error_R = 0;
-  DesiredSpeed_Setpoint = 0;
-  server.send(200,"text/plain","OK - Stopped");
-}
-void handleSetSpeed() {
-  String s = server.arg("value");
-  if (s!="") DesiredSpeed_Setpoint = s.toInt();
-  server.send(200,"text/plain","OK - Speed set to " + String(DesiredSpeed_Setpoint));
-}
-void handleSetPID() {
-  if (server.hasArg("kp_l")) KP_L = server.arg("kp_l").toFloat();
-  if (server.hasArg("ki_l")) KI_L = server.arg("ki_l").toFloat();
-  if (server.hasArg("kd_l")) KD_L = server.arg("kd_l").toFloat();
-  if (server.hasArg("kp_r")) KP_R = server.arg("kp_r").toFloat();
-  if (server.hasArg("ki_r")) KI_R = server.arg("ki_r").toFloat();
-  if (server.hasArg("kd_r")) KD_R = server.arg("kd_r").toFloat();
-  summederror_L = last_error_L = 0;
-  summederror_R = last_error_R = 0;
-  server.send(200,"text/plain","OK - PID Updated");
-}
-void handleGetData() {
-  String json = "{";
-  json += "\"target\":"   + String(DesiredSpeed_Setpoint);
-  json += ",\"measured_l\":" + String(MeasuredVelocity_CountsPerSec_L,1);
-  json += ",\"error_l\":"    + String(g_current_error_L,1);
-  json += ",\"pwm_l\":"      + String(g_current_pwm_output_L);
-  json += ",\"measured_r\":" + String(MeasuredVelocity_CountsPerSec_R,1);
-  json += ",\"error_r\":"    + String(g_current_error_R,1);
-  json += ",\"pwm_r\":"      + String(g_current_pwm_output_R);
-  json += "}";
-  server.send(200,"application/json",json);
-}
-
-// ===================== Setup =====================
 void setup() {
   Serial.begin(115200);
 
-  pinMode(DIR_PIN_1, OUTPUT); pinMode(DIR_PIN_2, OUTPUT); pinMode(SPEED_PIN_L, OUTPUT);
-  pinMode(DIR_PIN_3, OUTPUT); pinMode(DIR_PIN_4, OUTPUT); pinMode(SPEED_PIN_R, OUTPUT);
+  // 电机引脚
+  pinMode(DIR_PIN_1, OUTPUT);
+  pinMode(DIR_PIN_2, OUTPUT);
+  pinMode(SPEED_PIN_L, OUTPUT);
 
-  ledcAttach(SPEED_PIN_L, PWM_FREQ, PWM_BITS);
-  ledcAttach(SPEED_PIN_R, PWM_FREQ, PWM_BITS);
+  pinMode(DIR_PIN_3, OUTPUT);
+  pinMode(DIR_PIN_4, OUTPUT);
+  pinMode(SPEED_PIN_R, OUTPUT);
 
+  // 编码器输入（上拉，默认高）
   pinMode(ENCODER_PIN_L, INPUT_PULLUP);
   pinMode(ENCODER_PIN_R, INPUT_PULLUP);
-  lastLevel_L = digitalRead(ENCODER_PIN_L);
-  lastLevel_R = digitalRead(ENCODER_PIN_R);
-  lastEdge_us_L = micros();
-  lastEdge_us_R = micros();
+  prevL = digitalRead(ENCODER_PIN_L);
+  prevR = digitalRead(ENCODER_PIN_R);
 
-  digitalWrite(DIR_PIN_1, LOW); digitalWrite(DIR_PIN_2, LOW); ledcWrite(SPEED_PIN_L, 0);
-  digitalWrite(DIR_PIN_3, LOW); digitalWrite(DIR_PIN_4, LOW); ledcWrite(SPEED_PIN_R, 0);
+  // PWM
+  ledcAttach(SPEED_PIN_L, PWM_FREQ, PWM_BITS);
+  ledcAttach(SPEED_PIN_R, PWM_FREQ, PWM_BITS);
+  ledcWrite(SPEED_PIN_L, 0);
+  ledcWrite(SPEED_PIN_R, 0);
 
+  // 初始刹车
+  digitalWrite(DIR_PIN_1, LOW);
+  digitalWrite(DIR_PIN_2, LOW);
+  digitalWrite(DIR_PIN_3, LOW);
+  digitalWrite(DIR_PIN_4, LOW);
+
+  // AP
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255,255,255,0));
   WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.println(WiFi.softAPIP());
 
+  // 路由
   server.on("/", handleRoot);
   server.on("/forward", handleForward);
   server.on("/backward", handleBackward);
@@ -241,65 +106,155 @@ void setup() {
   last_pid_time = millis();
 }
 
-// ===================== Loop =====================
-void loop() {
-  // 1) 快速轮询编码器（不阻塞）
-  poll_encoders_fast();
+// ======== 轮询编码器：检测上升沿并计数 ========
+inline void pollEncoders() {
+  int curL = digitalRead(ENCODER_PIN_L);
+  if (prevL == LOW && curL == HIGH) {           // 上升沿
+    unsigned long now = micros();
+    if (now - lastEdgeUsL > DEBOUNCE_US) {
+      EncoderCounts_L++;                        // 只计数，不带符号
+      lastEdgeUsL = now;
+    }
+  }
+  prevL = curL;
 
-  // 2) 处理网页请求
+  int curR = digitalRead(ENCODER_PIN_R);
+  if (prevR == LOW && curR == HIGH) {
+    unsigned long now = micros();
+    if (now - lastEdgeUsR > DEBOUNCE_US) {
+      EncoderCounts_R++;
+      lastEdgeUsR = now;
+    }
+  }
+  prevR = curR;
+}
+
+void loop() {
   server.handleClient();
 
-  // 3) 每 50ms 做一次速度计算 + PID
+  // 高频轮询编码器（尽量每次 loop 都跑）
+  pollEncoders();
+
+  // 每 50ms 做一次速度估计 + PID
   if (millis() - last_pid_time < PID_SAMPLE_TIME_MS) return;
 
-  static long last_sw_L = 0, last_sw_R = 0;
-  long cur_sw_L = swCounts_L;
-  long cur_sw_R = swCounts_R;
-  long dL = cur_sw_L - last_sw_L;
-  long dR = cur_sw_R - last_sw_R;
-  last_sw_L = cur_sw_L;
-  last_sw_R = cur_sw_R;
+  noInterrupts(); // 这里不再有中断，但为确保与 pollEncoders 的一致性可短暂关一次
+  long current_counts_L = EncoderCounts_L;
+  long current_counts_R = EncoderCounts_R;
+  interrupts();
 
-  float cpsL = (float)dL * (1000.0f / PID_SAMPLE_TIME_MS);
-  float cpsR = (float)dR * (1000.0f / PID_SAMPLE_TIME_MS);
-  MeasuredVelocity_CountsPerSec_L = (motorDirection_L == 0) ? 0 : cpsL;
-  MeasuredVelocity_CountsPerSec_R = (motorDirection_R == 0) ? 0 : cpsR;
+  long counts_delta_L = current_counts_L - last_counts_L; last_counts_L = current_counts_L;
+  long counts_delta_R = current_counts_R - last_counts_R; last_counts_R = current_counts_R;
 
-  const float LARGE_SUM = 2000.0f;
-  int pwmL = 0, pwmR = 0;
+  MeasuredVelocity_CountsPerSec_L = (float)counts_delta_L * (1000.0 / PID_SAMPLE_TIME_MS);
+  MeasuredVelocity_CountsPerSec_R = (float)counts_delta_R * (1000.0 / PID_SAMPLE_TIME_MS);
 
+  int pwm_output_L = 0, pwm_output_R = 0;
+  float LARGE_SUM = 2000.0;
+
+  // 左轮
   if (motorDirection_L == 0) {
-    pwmL = 0; summederror_L = 0; last_error_L = 0; g_current_error_L = 0;
+    pwm_output_L = 0; summederror_L = 0; last_error_L = 0; g_current_error_L = 0;
   } else {
-    float errL = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_L;
-    g_current_error_L = errL;
-    summederror_L += errL;
+    float error_L = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_L;
+    g_current_error_L = error_L;
+    summederror_L += error_L;
     if (summederror_L >  LARGE_SUM) summederror_L =  LARGE_SUM;
     if (summederror_L < -LARGE_SUM) summederror_L = -LARGE_SUM;
-    float dL_err = errL - last_error_L; last_error_L = errL;
-    float uL = KP_L*errL + KI_L*summederror_L + KD_L*dL_err;
-    if (uL < 0) uL = 0; if (uL > 255) uL = 255;
-    pwmL = (int)uL;
+    float dL = error_L - last_error_L; last_error_L = error_L;
+    float outL = KP_L*error_L + KI_L*summederror_L + KD_L*dL;
+    if (outL < 0) outL = 0; if (outL > 255) outL = 255;
+    pwm_output_L = (int)outL;
   }
 
+  // 右轮
   if (motorDirection_R == 0) {
-    pwmR = 0; summederror_R = 0; last_error_R = 0; g_current_error_R = 0;
+    pwm_output_R = 0; summederror_R = 0; last_error_R = 0; g_current_error_R = 0;
   } else {
-    float errR = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_R;
-    g_current_error_R = errR;
-    summederror_R += errR;
+    float error_R = DesiredSpeed_Setpoint - MeasuredVelocity_CountsPerSec_R;
+    g_current_error_R = error_R;
+    summederror_R += error_R;
     if (summederror_R >  LARGE_SUM) summederror_R =  LARGE_SUM;
     if (summederror_R < -LARGE_SUM) summederror_R = -LARGE_SUM;
-    float dR_err = errR - last_error_R; last_error_R = errR;
-    float uR = KP_R*errR + KI_R*summederror_R + KD_R*dR_err;
-    if (uR < 0) uR = 0; if (uR > 255) uR = 255;
-    pwmR = (int)uR;
+    float dR = error_R - last_error_R; last_error_R = error_R;
+    float outR = KP_R*error_R + KI_R*summederror_R + KD_R*dR;
+    if (outR < 0) outR = 0; if (outR > 255) outR = 255;
+    pwm_output_R = (int)outR;
   }
 
-  g_current_pwm_output_L = pwmL;
-  g_current_pwm_output_R = pwmR;
+  g_current_pwm_output_L = pwm_output_L;
+  g_current_pwm_output_R = pwm_output_R;
   ledcWrite(SPEED_PIN_L, g_current_pwm_output_L);
   ledcWrite(SPEED_PIN_R, g_current_pwm_output_R);
 
+  Serial.printf("L: T:%d M:%.1f E:%.1f P:%d | R: T:%d M:%.1f E:%.1f P:%d\n",
+    DesiredSpeed_Setpoint, MeasuredVelocity_CountsPerSec_L, g_current_error_L, g_current_pwm_output_L,
+    DesiredSpeed_Setpoint, MeasuredVelocity_CountsPerSec_R, g_current_error_R, g_current_pwm_output_R);
+
   last_pid_time = millis();
+}
+
+// ========== HTTP handlers（原样保留）==========
+void handleRoot() { /* ……你原来的 HTML/JS …… */ server.send(200,"text/html",""); } // 这里省略：请用你现有的 handleRoot 内容
+void handleForward(){
+  digitalWrite(DIR_PIN_1, HIGH);  // IN1=1
+  digitalWrite(DIR_PIN_2, LOW);   // IN2=0  → 正转
+  digitalWrite(DIR_PIN_3, HIGH);
+  digitalWrite(DIR_PIN_4, LOW);
+  motorDirection_L = 1;
+  motorDirection_R = 1;
+  summederror_L = summederror_R = 0;
+  last_error_L = last_error_R = 0;
+  server.send(200,"text/plain","OK - Forward");
+}
+void handleBackward(){
+  digitalWrite(DIR_PIN_1, LOW);   // IN1=0
+  digitalWrite(DIR_PIN_2, HIGH);  // IN2=1  → 反转
+  digitalWrite(DIR_PIN_3, LOW);
+  digitalWrite(DIR_PIN_4, HIGH);
+  motorDirection_L = -1;
+  motorDirection_R = -1;
+  summederror_L = summederror_R = 0;
+  last_error_L = last_error_R = 0;
+  server.send(200,"text/plain","OK - Backward");
+}
+void handleStop(){
+  digitalWrite(DIR_PIN_1, LOW);
+  digitalWrite(DIR_PIN_2, LOW);
+  digitalWrite(DIR_PIN_3, LOW);
+  digitalWrite(DIR_PIN_4, LOW);
+  motorDirection_L = 0;
+  motorDirection_R = 0;
+  DesiredSpeed_Setpoint = 0;
+  summederror_L = summederror_R = 0;
+  last_error_L = last_error_R = 0;
+  server.send(200,"text/plain","OK - Stopped");
+}
+void handleSetSpeed(){
+  String s = server.arg("value");
+  if (s!="") DesiredSpeed_Setpoint = s.toInt();
+  server.send(200,"text/plain","OK");
+}
+void handleSetPID(){
+  if (server.hasArg("kp_l")) KP_L = server.arg("kp_l").toFloat();
+  if (server.hasArg("ki_l")) KI_L = server.arg("ki_l").toFloat();
+  if (server.hasArg("kd_l")) KD_L = server.arg("kd_l").toFloat();
+  if (server.hasArg("kp_r")) KP_R = server.arg("kp_r").toFloat();
+  if (server.hasArg("ki_r")) KI_R = server.arg("ki_r").toFloat();
+  if (server.hasArg("kd_r")) KD_R = server.arg("kd_r").toFloat();
+  summederror_L = summederror_R = 0;
+  last_error_L = last_error_R = 0;
+  server.send(200,"text/plain","OK - PID Updated");
+}
+void handleGetData(){
+  String json = "{";
+  json += "\"target\":" + String(DesiredSpeed_Setpoint);
+  json += ",\"measured_l\":" + String(MeasuredVelocity_CountsPerSec_L,1);
+  json += ",\"error_l\":" + String(g_current_error_L,1);
+  json += ",\"pwm_l\":" + String(g_current_pwm_output_L);
+  json += ",\"measured_r\":" + String(MeasuredVelocity_CountsPerSec_R,1);
+  json += ",\"error_r\":" + String(g_current_error_R,1);
+  json += ",\"pwm_r\":" + String(g_current_pwm_output_R);
+  json += "}";
+  server.send(200,"application/json",json);
 }
