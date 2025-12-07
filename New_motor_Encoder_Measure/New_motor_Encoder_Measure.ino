@@ -1,157 +1,157 @@
-// /*
-//  * ESP32-C3 + BTS7960 + CQR37D Motor RPM Test
-//  * * 接线定义:
-//  * - 编码器 A相: GPIO 5
-//  * - 编码器 B相: GPIO 4
-//  * - BTS7960 RPWM: GPIO 7
-//  * - BTS7960 LPWM: GPIO 6
-//  * - BTS7960 R_EN & L_EN: 必须连接到 3.3V 或 5V (高电平)
-//  */
-
-// // ================= 引脚定义 =================
-// const int ENCODER_A_PIN = 5;  // A相
-// const int ENCODER_B_PIN = 4;  // B相
-
-// const int RPWM_PIN = 7;       // 正转 PWM
-// const int LPWM_PIN = 6;       // 反转 PWM
-
-// // ================= 电机与编码器参数 =================
-// // 基础脉冲数: 16 (电机说明书)
-// // 倍频模式: 2 (代码使用 CHANGE 中断，即 2 倍频)
-// // 减速比: 70 (70:1 减速箱)
-// // 车轮转一圈的总脉冲数 = 16 * 2 * 70 = 2240
-// const float COUNTS_PER_REV = 2240.0; 
-
-// // ================= 变量定义 =================
-// volatile long duration = 0;       // 100ms 内的脉冲计数
-// volatile bool Direction = true;   // 方向标志位
-// volatile int encoder0PinALast = LOW;
-
-// // PWM 设置
-// const int PWM_FREQ = 10000;
-// const int PWM_RES = 8;
-// const int TEST_SPEED = 255;       // 测试速度 (0-255)
-
-// // ================= 中断服务函数 =================
-// // 统计 A 相的上升沿和下降沿 (2倍频)
-// void IRAM_ATTR wheelSpeed() {
-//   int Lstate = digitalRead(ENCODER_A_PIN);
-  
-//   // 检测电平变化
-//   if(Lstate != encoder0PinALast) {
-//     int val = digitalRead(ENCODER_B_PIN);
-    
-//     // 简单的正交解码逻辑
-//     if(val != Lstate) {
-//       Direction = true;  // Forward
-//     } else {
-//       Direction = false; // Reverse
-//     }
-    
-//     // 计数
-//     if(Direction) duration++;
-//     else duration--;
-//   }
-  
-//   encoder0PinALast = Lstate;
-// }
-
-// // ================= 初始化 =================
-// void setup() {
-//   Serial.begin(115200);
-//   Serial.println("--- Motor RPM Test Start ---");
-
-//   // 1. 配置引脚
-//   pinMode(ENCODER_A_PIN, INPUT_PULLUP); 
-//   pinMode(ENCODER_B_PIN, INPUT_PULLUP);
-
-//   // 2. 配置中断 (CHANGE = 上升沿+下降沿 = 2倍频)
-//   attachInterrupt(digitalPinToInterrupt(ENCODER_A_PIN), wheelSpeed, CHANGE);
-
-//   // 3. 配置电机 PWM
-//   ledcAttach(RPWM_PIN, PWM_FREQ, PWM_RES);
-//   ledcAttach(LPWM_PIN, PWM_FREQ, PWM_RES);
-  
-//   // 初始停止
-//   ledcWrite(RPWM_PIN, 0);
-//   ledcWrite(LPWM_PIN, 0);
-  
-//   // 读取初始状态
-//   encoder0PinALast = digitalRead(ENCODER_A_PIN);
-// }
-
-// // ================= 主循环 =================
-// void loop() {
-//   // 1. 让电机以设定速度转动 (正转)
-//   ledcWrite(LPWM_PIN, 0);
-//   ledcWrite(RPWM_PIN, TEST_SPEED); 
-
-//   // 2. 计算与打印
-//   long currentPulse = duration;     // 读取当前 0.1秒内的计数
-//   duration = 0;                     // 清零，准备下一次统计
-  
-//   // RPM 计算公式:
-//   // (脉冲数 * 600) / 每圈总脉冲数
-//   // 乘以 600 是因为我们每 0.1秒 (100ms) 统计一次，要转换成每分钟 (60秒)
-//   float rpm = (currentPulse * 600.0) / COUNTS_PER_REV;
-
-//   // 3. 串口打印
-//   Serial.print("PWM: ");
-//   Serial.print(TEST_SPEED);
-//   Serial.print(" | Pulse(0.1s): ");
-//   Serial.print(currentPulse);
-//   Serial.print(" | Wheel RPM: ");
-//   Serial.println(rpm);
-
-//   // 采样间隔 100ms
-//   delay(100);
-// }
-
 #include <Arduino.h>
-#include <esp32-hal-ledc.h> 
+#include <WiFi.h>
+#include <WebServer.h>
+// #include <esp32-hal-ledc.h> 
 
-// ===================== 全局参数 (恢复旧逻辑) =====================
-// 恢复您旧代码中的参数定义 (16 * 2 * 70 = 2240.0)
-const float COUNTS_PER_REV = 4480.0; 
+// ===================== 用户配置区 =====================
+#define INVERT_M1_ENCODER false
+#define INVERT_M2_ENCODER true   // 右轮反接修正
 
-// PWM 设置
+const char *ssid = "ESP32_PID_Control";
+const char *password = "12345678";
+
+// ===================== 参数调试区 =====================
+// 左电机 (M1) PID
+float Kp1 = 3.0, Ki1 = 0.0, Kd1 = 0.1;
+// 右电机 (M2) PID
+float Kp2 = 2.93, Ki2 = 0.0, Kd2 = 0.1;
+
+// 默认巡航速度
+const float CRUISE_SPEED = 50.0;
+
+// *** 关键参数：原地旋转 90 度所需的时间 (毫秒) ***
+// 修正记录：原 1000ms 导致过冲约 7 度。
+// 修正计算：1000 * (90/97) ≈ 927ms。取整为 920ms。
+// 请根据实际地面摩擦力微调此值！
+const int TURN_90_DURATION_MS = 965; 
+
+// ===================== 全局参数 =====================
+const float COUNTS_PER_REV = 4480.0;
 const int PWM_FREQ = 20000;
 const int PWM_RES = 8;
-const int TEST_SPEED = 255; // 固定 PWM 值
+const int SAMPLE_TIME_MS = 100; 
 
-// 采样间隔
-const int SAMPLE_TIME_MS = 100;
+volatile float target_rpm_m1 = 0.0;
+volatile float target_rpm_m2 = 0.0;
 
-// ===================== 电机 1 (左) 定义 =====================
+// 动作计时器
+unsigned long action_start_time = 0;
+bool is_turning_90 = false;
+
+float current_rpm1 = 0;
+float current_rpm2 = 0;
+int pwm1 = 0;
+int pwm2 = 0;
+
+// ===================== PID 类定义 =====================
+class SimplePID {
+  public:
+    float kp, ki, kd;
+    float integral = 0;
+    float prev_error = 0;
+    
+    SimplePID(float p, float i, float d) : kp(p), ki(i), kd(d) {}
+
+    int compute(float target, float current, float dt) {
+      float error = target - current;
+      integral += error * dt;
+      integral = constrain(integral, -255.0, 255.0); 
+      float derivative = (error - prev_error) / dt;
+      prev_error = error;
+      float output = (kp * error) + (ki * integral) + (kd * derivative);
+      return (int)constrain(output, -255, 255);
+    }
+    
+    void reset() {
+      integral = 0;
+      prev_error = 0;
+    }
+};
+
+SimplePID pid1(Kp1, Ki1, Kd1);
+SimplePID pid2(Kp2, Ki2, Kd2);
+
+// ===================== 电机定义 =====================
 const int M1_ENCODER_A_PIN = 5;
-const int M1_ENCODER_B_PIN = 4; 
-const int M1_RPWM_PIN = 7; 
-const int M1_LPWM_PIN = 6; 
-
+const int M1_ENCODER_B_PIN = 4;
+const int M1_RPWM_PIN = 7;
+const int M1_LPWM_PIN = 6;
 volatile long M1_duration = 0;
-volatile bool M1_Direction = true;
 volatile int M1_encoder0PinALast = LOW;
 
-// ===================== 电机 2 (右) 定义 =====================
 const int M2_ENCODER_A_PIN = 18;
-const int M2_ENCODER_B_PIN = 19; 
-const int M2_RPWM_PIN = 0; // GPIO 0
-const int M2_LPWM_PIN = 1; // GPIO 1
-
+const int M2_ENCODER_B_PIN = 19;
+const int M2_RPWM_PIN = 0;
+const int M2_LPWM_PIN = 1;
 volatile long M2_duration = 0;
-volatile bool M2_Direction = true;
 volatile int M2_encoder0PinALast = LOW;
 
+WebServer server(80);
 
-// ===================== 中断服务函数 (不变) =====================
+// ===================== 网页代码 =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8">
+  <title>ESP32 Robot Control</title>
+  <style>
+    body { font-family: Arial; text-align: center; margin:0px auto; padding: 10px; background: #f4f4f4;}
+    .card { background: white; max-width: 600px; margin: 0 auto; padding: 20px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); border-radius: 10px; }
+    button { padding: 15px 25px; margin: 5px; cursor: pointer; border: none; border-radius: 8px; font-size: 18px; font-weight: bold; }
+    .btn-stop { background: #dc3545; color: white; width: 100%; margin-top: 10px;}
+    .btn-dir { background: #007bff; color: white; width: 40%; }
+    .btn-turn90 { background: #6f42c1; color: white; width: 40%; font-size: 16px; }
+    .grid-container { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; justify-items: center; margin-bottom: 20px; }
+    .data-row { display: flex; justify-content: space-between; align-items: center; margin: 5px 0; padding: 5px; background: #eee; border-radius: 5px;}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🎮 机器人方向控制</h2>
+    
+    <div class="grid-container">
+      <div class="grid-item"><button class="btn-turn90" onclick="turn90('L')">↺ 90°</button></div>
+      <div class="grid-item"><button class="btn-dir" onclick="move('F')">⬆️</button></div>
+      <div class="grid-item"><button class="btn-turn90" onclick="turn90('R')">↻ 90°</button></div>
+      
+      <div class="grid-item"><button class="btn-dir" onclick="move('L')">⬅️</button></div>
+      <div class="grid-item"><button class="btn-stop" onclick="move('S')" style="width: 80px; padding: 15px 0;">🛑</button></div>
+      <div class="grid-item"><button class="btn-dir" onclick="move('R')">➡️</button></div>
+      
+      <div class="grid-item"></div>
+      <div class="grid-item"><button class="btn-dir" onclick="move('B')">⬇️</button></div>
+      <div class="grid-item"></div>
+    </div>
+
+    <h3>实时监控 (RPM)</h3>
+    <div class="data-row" style="color:#d32f2f"><b>M1 (左): <span id="rpm1">0</span></b></div>
+    <div class="data-row" style="color:#1976d2"><b>M2 (右): <span id="rpm2">0</span></b></div>
+  </div>
+
+<script>
+  function move(dir) { fetch("/move?dir=" + dir); }
+  function turn90(dir) { fetch("/turn90?dir=" + dir); }
+
+  setInterval(function() {
+    fetch("/data").then(response => response.json()).then(json => {
+      document.getElementById("rpm1").innerText = json.m1.toFixed(1);
+      document.getElementById("rpm2").innerText = json.m2.toFixed(1);
+    });
+  }, 200);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ===================== 中断服务 =====================
 void IRAM_ATTR wheelSpeed_M1() {
   int Lstate = digitalRead(M1_ENCODER_A_PIN);
   if(Lstate != M1_encoder0PinALast) {
     int val = digitalRead(M1_ENCODER_B_PIN);
-    if(val != Lstate) M1_Direction = true;  
-    else M1_Direction = false;  
-    if(M1_Direction) M1_duration++;
-    else M1_duration--;
+    bool dir = (val != Lstate);
+    if (INVERT_M1_ENCODER) dir = !dir;
+    if(dir) M1_duration++; else M1_duration--;
   }
   M1_encoder0PinALast = Lstate;
 }
@@ -160,91 +160,144 @@ void IRAM_ATTR wheelSpeed_M2() {
   int Lstate = digitalRead(M2_ENCODER_A_PIN);
   if(Lstate != M2_encoder0PinALast) {
     int val = digitalRead(M2_ENCODER_B_PIN);
-    if(val != Lstate) M2_Direction = true;  
-    else M2_Direction = false;  
-    if(M2_Direction) M2_duration++;
-    else M2_duration--;
+    bool dir = (val != Lstate);
+    if (INVERT_M2_ENCODER) dir = !dir;
+    if(dir) M2_duration++; else M2_duration--;
   }
   M2_encoder0PinALast = Lstate;
 }
 
-
-// ===================== 电机驱动函数 (不变) =====================
-void set_motor_speed(int rpwm_pin, int lpwm_pin, int speed) {
-    if (speed >= 0) {
-        ledcWrite(lpwm_pin, 0);          
-        ledcWrite(rpwm_pin, speed); 
-    } 
+// ===================== 驱动逻辑 =====================
+void set_motor_pwm(int rpwm_pin, int lpwm_pin, int pwm_val) {
+  if (pwm_val > 0) {
+    ledcWrite(lpwm_pin, 0);          
+    ledcWrite(rpwm_pin, pwm_val); 
+  } else {
+    ledcWrite(lpwm_pin, abs(pwm_val));          
+    ledcWrite(rpwm_pin, 0); 
+  }
 }
 
+// ===================== Web Handlers =====================
+void handleRoot() { server.send(200, "text/html", index_html); }
 
-// ===================== 初始化 (不变) =====================
-void setup() {
-    delay(1000); 
-    
-    Serial.begin(115200);
-    Serial.printf("--- 双电机固定速度测试启动 (Counts/Rev: %.1f) ---\n", COUNTS_PER_REV);
+void handleMove() {
+  if (server.hasArg("dir")) {
+    String dir = server.arg("dir");
+    pid1.reset(); pid2.reset();
+    is_turning_90 = false; 
 
-    // 1. 配置编码器引脚
-    pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP); 
-    pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
-    pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP);
-    pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
-
-    // 2. 配置中断
-    attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
-    attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
-
-    // 3. 配置电机 PWM
-    ledcAttach(M1_RPWM_PIN, PWM_FREQ, PWM_RES);
-    ledcAttach(M1_LPWM_PIN, PWM_FREQ, PWM_RES);
-    ledcAttach(M2_RPWM_PIN, PWM_FREQ, PWM_RES);
-    ledcAttach(M2_LPWM_PIN, PWM_FREQ, PWM_RES);
-    
-    // 初始停止
-    set_motor_speed(M1_RPWM_PIN, M1_LPWM_PIN, 0);
-    set_motor_speed(M2_RPWM_PIN, M2_LPWM_PIN, 0);
-    
-    // 读取初始状态
-    M1_encoder0PinALast = digitalRead(M1_ENCODER_A_PIN);
-    M2_encoder0PinALast = digitalRead(M2_ENCODER_A_PIN);
-}
-
-// ===================== 主循环 =====================
-void loop() {
-    static unsigned long last_time = 0;
-    
-    if (millis() - last_time >= SAMPLE_TIME_MS) {
-        
-        // 1. 驱动电机 (固定正转)
-        set_motor_speed(M1_RPWM_PIN, M1_LPWM_PIN, TEST_SPEED);
-        set_motor_speed(M2_RPWM_PIN, M2_LPWM_PIN, TEST_SPEED);
-
-        // 我们将使用固定 100ms 采样时间进行计算，简化公式：
-        // 600.0 = 60s/min / 0.1s/sample
-        const float RPM_CONVERSION_FACTOR = 600.0;
-        
-        // --- M1 数据处理 ---
-        noInterrupts(); 
-        long pulse1 = M1_duration; 
-        M1_duration = 0;
-        interrupts();   
-        
-        // RPM 计算: (Pulse * 600.0) / COUNTS_PER_REV
-        float rpm1 = ((float)pulse1 * RPM_CONVERSION_FACTOR) / COUNTS_PER_REV;
-
-        // --- M2 数据处理 ---
-        noInterrupts(); 
-        long pulse2 = M2_duration;
-        M2_duration = 0;
-        interrupts();   
-        
-        float rpm2 = ((float)pulse2 * RPM_CONVERSION_FACTOR) / COUNTS_PER_REV;
-        
-        // 2. 串口打印
-        Serial.printf("M1 Pulse:%4ld | M1 RPM:%.1f | M2 Pulse:%4ld | M2 RPM:%.1f\n",
-                      pulse1, rpm1, pulse2, rpm2);
-
-        last_time = millis();
+    if (dir == "F") {      
+      target_rpm_m1 = CRUISE_SPEED; target_rpm_m2 = CRUISE_SPEED;
+    } else if (dir == "B") { 
+      target_rpm_m1 = -CRUISE_SPEED; target_rpm_m2 = -CRUISE_SPEED;
+    } else if (dir == "L") { 
+      target_rpm_m1 = -CRUISE_SPEED; target_rpm_m2 = CRUISE_SPEED;
+    } else if (dir == "R") { 
+      target_rpm_m1 = CRUISE_SPEED; target_rpm_m2 = -CRUISE_SPEED;
+    } else if (dir == "S") { 
+      target_rpm_m1 = 0; target_rpm_m2 = 0;
     }
+    server.send(200, "text/plain", "OK");
+  }
+}
+
+void handleTurn90() {
+  if (server.hasArg("dir")) {
+    String dir = server.arg("dir");
+    pid1.reset(); pid2.reset();
+    
+    if (dir == "L") {
+      target_rpm_m1 = -CRUISE_SPEED;
+      target_rpm_m2 = CRUISE_SPEED;
+    } else { // R
+      target_rpm_m1 = CRUISE_SPEED;
+      target_rpm_m2 = -CRUISE_SPEED;
+    }
+    
+    is_turning_90 = true;
+    action_start_time = millis();
+    
+    server.send(200, "text/plain", "Turning 90");
+  }
+}
+
+void handleData() {
+  String json = "{\"m1\":" + String(current_rpm1) + ",\"m2\":" + String(current_rpm2) + "}";
+  server.send(200, "application/json", json);
+}
+
+// ===================== Setup & Loop =====================
+void setup() {
+  Serial.begin(115200);
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  server.on("/", handleRoot);
+  server.on("/move", handleMove);
+  server.on("/turn90", handleTurn90); 
+  server.on("/data", handleData);
+  server.begin();
+
+  pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP); 
+  pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
+
+  ledcAttach(M1_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_LPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_LPWM_PIN, PWM_FREQ, PWM_RES);
+}
+
+void loop() {
+  server.handleClient();
+
+  static unsigned long last_time = 0;
+  unsigned long now = millis();
+  
+  if (is_turning_90) {
+    // 修正：减少时间以补偿惯性 (从 1000ms 改为 920ms)
+    if (now - action_start_time >= TURN_90_DURATION_MS) {
+      target_rpm_m1 = 0;
+      target_rpm_m2 = 0;
+      is_turning_90 = false;
+      
+      // 强制刹车：立即输出 0 PWM
+      set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, 0);
+      set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, 0);
+      
+      // 重置 PID 积分项，防止刹车后又蠕动
+      pid1.reset();
+      pid2.reset();
+      
+      Serial.println("Turn 90 Complete (Braking)");
+    }
+  }
+  
+  if (now - last_time >= SAMPLE_TIME_MS) {
+    float dt = (now - last_time) / 1000.0; 
+    
+    noInterrupts();
+    long p1 = M1_duration; M1_duration = 0;
+    long p2 = M2_duration; M2_duration = 0;
+    interrupts();
+
+    current_rpm1 = (p1 / COUNTS_PER_REV) * 60.0 / dt;
+    current_rpm2 = (p2 / COUNTS_PER_REV) * 60.0 / dt;
+
+    if (abs(target_rpm_m1) > 0.1) pwm1 = pid1.compute(target_rpm_m1, current_rpm1, dt);
+    else pwm1 = 0;
+
+    if (abs(target_rpm_m2) > 0.1) pwm2 = pid2.compute(target_rpm_m2, current_rpm2, dt);
+    else pwm2 = 0;
+
+    set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, pwm1);
+    set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, pwm2);
+
+    last_time = now;
+  }
 }
