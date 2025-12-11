@@ -1,0 +1,222 @@
+#include <Arduino.h>
+#include "vive510.h"
+#include <math.h>    // atan2, PI
+#include <algorithm> // 用于 std::sort
+
+// ===================== 1. 全局定义和引脚 =====================
+
+// Vive 引脚和对象
+#define SIGNALPIN1 1    // Vive1 信号引脚 (GPIO 0)
+#define SIGNALPIN2 12   // Vive2 信号引脚 (GPIO 12)
+
+Vive510 vive1(SIGNALPIN1);
+Vive510 vive2(SIGNALPIN2);
+
+// Vive 坐标 & 有效标志
+uint16_t vive1_x = 0, vive1_y = 0;
+uint16_t vive2_x = 0, vive2_y = 0;
+bool vive1_valid = false, vive2_valid = false;
+
+// ===================== 2. 异常值去除类和参数 =====================
+
+// 【滑动窗口参数】
+const int WINDOW_SIZE = 5; // 中值滤波窗口大小 (N次历史数据)
+// 【异常值阈值】
+// 允许的偏差阈值 (毫米)。 Vive 坐标单位通常是毫米(mm)。
+// 设定 500 mm (50 cm) 为一个合理的异常跳变阈值。
+const float OUTLIER_THRESHOLD_MM = 500.0; 
+
+
+class MedianFilter {
+public:
+    uint16_t history[WINDOW_SIZE];
+    int head = 0;
+    int count = 0;
+
+    MedianFilter() {
+        for (int i = 0; i < WINDOW_SIZE; ++i) {
+            history[i] = 0;
+        }
+    }
+
+    // 增加新值到窗口
+    void addValue(uint16_t val) {
+        history[head] = val;
+        head = (head + 1) % WINDOW_SIZE;
+        if (count < WINDOW_SIZE) {
+            count++;
+        }
+    }
+
+    // 获取当前窗口的中值
+    uint16_t getMedian() {
+        if (count == 0) return 0;
+        
+        // 创建一个临时数组进行排序
+        uint16_t sorted[WINDOW_SIZE];
+        for (int i = 0; i < count; ++i) {
+            sorted[i] = history[i];
+        }
+
+        // 排序
+        std::sort(sorted, sorted + count);
+        
+        // 返回中值
+        if (count % 2 != 0) {
+            // 奇数个元素，返回中间值
+            return sorted[count / 2];
+        } else {
+            // 偶数个元素，返回中间两个的平均值 (简化处理，仍取偏小的那个)
+            return sorted[count / 2 - 1];
+        }
+    }
+};
+
+// 针对 Vive 1 X 坐标的过滤器实例
+MedianFilter filterV1X;
+
+// 异常值检测和过滤函数
+// 如果是异常值 (偏离中值超过阈值)，返回 false
+bool filterViveValue(uint16_t current_val, MedianFilter& filter) {
+    uint16_t median = filter.getMedian();
+    
+    // 如果历史记录不足，先接受当前值并填充历史
+    if (filter.count < WINDOW_SIZE / 2 + 1) {
+        filter.addValue(current_val);
+        return true;
+    }
+    
+    // 检查当前值是否偏离中值太远
+    if (abs((long)current_val - (long)median) > OUTLIER_THRESHOLD_MM) {
+        // 检测到异常值，拒绝该值，不更新历史记录
+        return false;
+    }
+
+    // 接受该值，并更新历史记录
+    filter.addValue(current_val);
+    return true;
+}
+
+
+// ===================== 3. 辅助函数（更新和姿态计算） =====================
+
+// Vive 更新函数（包含异常值去除）
+void updateVive() {
+  // Vive1 读取
+  if (vive1.status() == VIVE_RECEIVING) {
+    uint16_t x_raw = vive1.xCoord();
+    uint16_t y_raw = vive1.yCoord();
+    
+    // 1. 简单范围判定 (1000 到 8000 之间)
+    bool range_ok = (x_raw > 1000 && x_raw < 8000 && y_raw > 1000 && y_raw < 8000);
+    
+    // 2. X坐标异常值检测 (只对X进行演示)
+    bool x_filter_ok = filterViveValue(x_raw, filterV1X); 
+    
+    if (range_ok && x_filter_ok) {
+      vive1_x = x_raw; // 使用原始值，因为它通过了过滤
+      vive1_y = y_raw; // Y坐标暂时没有过滤，直接使用
+      vive1_valid = true;
+    } else {
+      vive1_valid = false;
+    }
+  } else {
+    vive1_valid = false;
+    vive1.sync(5); 
+  }
+
+  delay(10); 
+
+  // Vive2 读取 (保持原始逻辑，无中值滤波)
+  if (vive2.status() == VIVE_RECEIVING) {
+    uint16_t x = vive2.xCoord();
+    uint16_t y = vive2.yCoord();
+    if (x > 1000 && x < 8000 && y > 1000 && y < 8000) {
+      vive2_x = x;
+      vive2_y = y;
+      vive2_valid = true;
+    } else {
+      vive2_valid = false;
+    }
+  } else {
+    vive2_valid = false;
+    vive2.sync(5); 
+  }
+}
+
+// 根据两个 Vive 求机器人位置和朝向 (不变)
+bool getRobotPose(float &rx, float &ry, float &thetaRad) {
+  // 即使 vive1_valid = false，我们仍然可以使用上次有效的数据来计算姿态，
+  // 但为了安全和调试，这里保持严格要求两个都有效。
+  if (!(vive1_valid && vive2_valid)) return false; 
+
+  rx = (vive1_x + vive2_x) * 0.5f;
+  ry = (vive1_y + vive2_y) * 0.5f;
+
+  int32_t dx = (int32_t)vive2_x - (int32_t)vive1_x;
+  int32_t dy = (int32_t)vive2_y - (int32_t)vive1_y;
+  if (dx == 0 && dy == 0) return false;
+
+  thetaRad = atan2f((float)dy, (float)dx); // -pi ~ pi
+  return true;
+}
+
+// ===================== 4. Setup & Loop =====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(100); 
+  
+  // 1. 初始化 Vive
+  vive1.begin();
+  vive2.begin();
+  
+  Serial.println("------------------------------------");
+  Serial.println("Vive Tracker Initialization Complete (with Outlier Rejection).");
+  Serial.printf("Vive1 Pin: %d, Vive2 Pin: %d\n", SIGNALPIN1, SIGNALPIN2);
+  Serial.printf("Filtering (V1X): Window=%d, Threshold=%d mm\n", WINDOW_SIZE, (int)OUTLIER_THRESHOLD_MM);
+  Serial.println("------------------------------------");
+}
+
+void loop() {
+  // 1. 更新 Vive 坐标 (会执行过滤)
+  updateVive();
+
+  float rx, ry, theta;
+  
+  // 2. 打印 Vive 1 & 2 原始坐标
+  Serial.print("V1X_Med:"); Serial.print(filterV1X.getMedian());
+  Serial.print(" | V1: (");
+  Serial.print(vive1_valid ? String(vive1_x) : "---");
+  Serial.print(", ");
+  Serial.print(vive1_valid ? String(vive1_y) : "---");
+  Serial.print(") | ");
+
+  Serial.print("V2: (");
+  Serial.print(vive2_valid ? String(vive2_x) : "---");
+  Serial.print(", ");
+  Serial.print(vive2_valid ? String(vive2_y) : "---");
+  Serial.print(") | ");
+
+  // 3. 计算并打印机器人位姿
+  if (getRobotPose(rx, ry, theta)) {
+    float thetaDeg = theta * 180.0 / PI; 
+    
+    Serial.print("Pose: X=");
+    Serial.print(rx, 1);
+    Serial.print(", Y=");
+    Serial.print(ry, 1);
+    Serial.print(", Th=");
+    Serial.print(thetaDeg, 1);
+    Serial.println(" deg");
+  } else {
+    // 增加了一个提示，说明 Vive1 X 坐标可能是被过滤掉的
+    if (vive1.status() == VIVE_RECEIVING && !vive1_valid) {
+      Serial.println("Pose: Invalid/Lost Tracking (V1X likely filtered).");
+    } else {
+      Serial.println("Pose: Invalid/Lost Tracking.");
+    }
+  }
+  
+  delay(200); // 每 200ms 打印一次
+}
