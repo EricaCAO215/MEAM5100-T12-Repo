@@ -1,0 +1,517 @@
+/*
+ * Board: ESP32-S2 (Master) - Reactive Navigation Mode
+ * Role: Web Server, Sensor, PID, Motor Control, State Machine
+ * * 导航逻辑:
+ * 1. 目标循墙距离当前是 16.0 cm（WALL_TARGET_DISTANCE_CM）。
+ * 2. 运行时，执行右侧循墙 (WALL_FOLLOW_KP) 逻辑。
+ * 3. 寻墙速度：AUTO_FORWARD_RPM （默认 70）。
+ */
+#include <Wire.h>
+#include <VL53L0X.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ===================== 1. 全局定义和引脚 =====================
+// I2C (ToF)
+#define MY_SDA 8
+#define MY_SCL 9
+
+// 两个 ToF 的 XSHUT 引脚：前向 = 11，右侧 = 10
+#define XSHUT_FRONT 11   // 前向 ToF
+#define XSHUT_SIDE  10   // 右向 ToF
+
+// 修改后的 I2C 地址
+#define ADDR_FRONT 0x2A
+#define ADDR_SIDE  0x2B
+
+// 【新电机和编码器引脚】
+#define INVERT_M1_ENCODER false // M1 编码器方向配置
+#define INVERT_M2_ENCODER true  // M2 编码器方向配置
+
+const int M1_ENCODER_A_PIN = 7;
+const int M1_ENCODER_B_PIN = 3;
+const int M1_RPWM_PIN = 33;
+const int M1_LPWM_PIN = 38;
+
+const int M2_ENCODER_A_PIN = 18;
+const int M2_ENCODER_B_PIN = 14;
+const int M2_RPWM_PIN = 6;
+const int M2_LPWM_PIN = 5;
+
+// ===================== 2. 变量与对象 =====================
+// 两个 ToF 传感器：前向 + 右侧循墙
+VL53L0X tofFront;
+VL53L0X tofSide;
+
+WebServer server(80);
+
+// WiFi 配置
+const char* ssid = "ESP32_Robot_Master";
+const char* password = "12345678";
+IPAddress local_ip(192, 168, 10, 1);
+IPAddress gateway(192, 168, 10, 1);
+IPAddress subnet(255, 255, 255, 0);
+
+// 传感器数据
+float val_front = 0.0;   // 前向 ToF
+float val_side  = 0.0;   // 右侧 ToF（循墙用）
+bool obs_front  = false;
+
+// PID 参数
+float Kp1 = 3.0,  Ki1 = 0.0, Kd1 = 0.1;
+float Kp2 = 2.93, Ki2 = 0.0, Kd2 = 0.1;
+const float MAX_SPEED_RPM = 60.0;
+const float COUNTS_PER_REV = 4480.0;
+
+// 运动控制变量
+volatile float target_rpm_m1 = 0.0;
+volatile float target_rpm_m2 = 0.0;
+float current_rpm1 = 0; 
+float current_rpm2 = 0;
+int pwm1 = 0;
+int pwm2 = 0;
+
+// 编码器计时变量
+volatile long M1_duration = 0;
+volatile int  M1_encoder0PinALast = LOW;
+volatile long M2_duration = 0;
+volatile int  M2_encoder0PinALast = LOW;
+
+// 传感器计时
+unsigned long last_PID_time = 0;
+const int PID_INTERVAL_MS = 100;
+
+// 【导航状态和循墙参数】
+#define NAV_STATE_STOP         0
+#define NAV_STATE_FORWARD      1 
+#define NAV_STATE_TURNING      2
+#define NAV_STATE_WALL_FOLLOW  3
+
+int nav_state = NAV_STATE_STOP;
+
+const float AUTO_FORWARD_RPM       = 70.0;   // 基础前进和循墙速度
+const float OBSTACLE_THRESHOLD_CM  = 20.0;
+const float WALL_TARGET_DISTANCE_CM = 16.0;  // 目标循墙距离 (右侧)
+const float WALL_FOLLOW_KP         = 2.0;    // 循墙 P 控制增益
+const float TURN_SPEED_RPM         = 30.0;   // 转弯速度
+const unsigned long TURN_DURATION_MS = 1000; // 90度转弯时间（需实测）
+
+unsigned long turn_start_time = 0; 
+
+// 循墙PD运行时变量（目前只用到 P）
+float wall_last_error = 0.0;
+unsigned long wall_last_time = 0; 
+
+// ===================== ToF 长距离配置函数 =====================
+void setLongRange(VL53L0X* sensor) {
+  // 稳定测距到 ~1.3m 的设置
+  sensor->setSignalRateLimit(0.1);
+  sensor->setMeasurementTimingBudget(50000);
+  sensor->setVcselPulsePeriod(VL53L0X::VcselPeriodPreRange, 18);
+  sensor->setVcselPulsePeriod(VL53L0X::VcselPeriodFinalRange, 14);
+}
+
+// ===================== 3. PID 类 / 中断函数 =====================
+class SimplePID { 
+  public: 
+    float kp, ki, kd, integral = 0, prev_error = 0; 
+    SimplePID(float p,float i,float d):kp(p),ki(i),kd(d){} 
+    int compute(float t,float c,float dt){
+      float e = t - c;
+      integral += e * dt;
+      integral = constrain(integral, -255, 255);
+      float d_val = (e - prev_error) / dt;
+      prev_error = e;
+      return constrain(kp * e + ki * integral + kd * d_val, -255, 255);
+    } 
+    void reset(){ integral = 0; prev_error = 0; }
+};
+SimplePID pid1(Kp1,Ki1,Kd1); 
+SimplePID pid2(Kp2,Ki2,Kd2);
+
+void IRAM_ATTR wheelSpeed_M1(){
+  int s = digitalRead(M1_ENCODER_A_PIN);
+  if(s != M1_encoder0PinALast){
+    int val = digitalRead(M1_ENCODER_B_PIN);
+    bool dir = (val != s); 
+    if (INVERT_M1_ENCODER) dir = !dir; 
+    if(dir) M1_duration++; else M1_duration--;
+  }
+  M1_encoder0PinALast = s;
+}
+
+void IRAM_ATTR wheelSpeed_M2(){
+  int s = digitalRead(M2_ENCODER_A_PIN);
+  if(s != M2_encoder0PinALast){
+    int val = digitalRead(M2_ENCODER_B_PIN);
+    bool dir = (val != s); 
+    if (INVERT_M2_ENCODER) dir = !dir; 
+    if(dir) M2_duration++; else M2_duration--;
+  }
+  M2_encoder0PinALast = s;
+}
+
+void set_motor_pwm(int r,int l,int v){
+  if(v > 0){
+    ledcWrite(l, 0);
+    ledcWrite(r, v);
+  }else{
+    ledcWrite(l, abs(v));
+    ledcWrite(r, 0);
+  }
+}
+
+// ===================== 4. 导航逻辑 =====================
+void runNavigationLogic() {
+  // 只要前方障碍物小于阈值，就视为“堵住”
+  bool frontal_blockage = (val_front > 0 && val_front < OBSTACLE_THRESHOLD_CM);
+  float base_speed = AUTO_FORWARD_RPM;
+
+  switch (nav_state) {
+    case NAV_STATE_FORWARD:
+      if (frontal_blockage) {
+        nav_state = NAV_STATE_TURNING;
+        turn_start_time = millis();
+        target_rpm_m1 = -TURN_SPEED_RPM; 
+        target_rpm_m2 =  TURN_SPEED_RPM;
+        pid1.reset(); 
+        pid2.reset();
+      } else {
+        nav_state = NAV_STATE_WALL_FOLLOW;
+      }
+      break;
+            
+    case NAV_STATE_WALL_FOLLOW:
+      if (frontal_blockage) {
+        nav_state = NAV_STATE_TURNING;
+        turn_start_time = millis();
+        target_rpm_m1 = -TURN_SPEED_RPM; 
+        target_rpm_m2 =  TURN_SPEED_RPM;
+        pid1.reset(); 
+        pid2.reset();
+      } else {
+        // 右侧循墙控制：目标距离 - 当前距离
+        float wall_error = WALL_TARGET_DISTANCE_CM - val_side;
+        float steer_command = wall_error * WALL_FOLLOW_KP;
+        steer_command = constrain(steer_command, -TURN_SPEED_RPM, TURN_SPEED_RPM); 
+
+        // 差速：左轮=base-转向，右轮=base+转向
+        target_rpm_m1 = base_speed - steer_command;
+        target_rpm_m2 = base_speed + steer_command;
+        if (target_rpm_m1 < 0) target_rpm_m1 = 0;
+      }
+      break;
+
+    case NAV_STATE_TURNING:
+      if (millis() - turn_start_time >= TURN_DURATION_MS) {
+        nav_state = NAV_STATE_WALL_FOLLOW;
+        pid1.reset(); 
+        pid2.reset();
+      } else {
+        // 持续原地左转
+      }
+      break;
+
+    case NAV_STATE_STOP:
+    default:
+      target_rpm_m1 = 0.0;
+      target_rpm_m2 = 0.0;
+      break;
+  }
+}
+
+// ===================== 5. Web Server =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta charset="utf-8">
+<title>ROBA Master</title>
+<style>
+body { font-family: sans-serif; text-align: center; margin:0; background: #f4f4f4; color: #333; touch-action: none; }
+h2 { margin: 15px 0; color: #444; }
+
+.panel { display: flex; justify-content: center; gap: 15px; margin: 20px; }
+.card { background: #fff; padding: 15px; border-radius: 12px; width: 45%; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+.val { font-size: 2rem; font-weight: bold; color: #2c3e50; }
+.lbl { font-size: 0.9rem; color: #7f8c8d; margin-bottom: 5px; }
+
+.danger { border: 3px solid #e74c3c; background: #fadbd8; }
+.safe { border: 3px solid #2ecc71; }
+
+#joy-zone {
+position: relative; width: 240px; height: 240px; margin: 20px auto;
+background: #dde; border-radius: 50%; border: 4px solid #bbb;
+box-shadow: inset 0 0 20px rgba(0,0,0,0.1);
+}
+#joy-knob {
+position: absolute; width: 80px; height: 80px; background: #3498db;
+border-radius: 50%; top: 50%; left: 50%; transform: translate(-50%, -50%);
+box-shadow: 0 5px 15px rgba(0,0,0,0.3);
+}
+.rpm { font-family: monospace; font-size: 1.2rem; margin-top: 20px; color: #555; }
+</style>
+</head>
+<body>
+<h2>ROBA Master Control</h2>
+
+<div class="panel">
+<div id="c-front" class="card safe">
+<div class="lbl">FRONT (ToF)</div>
+<div id="v-front" class="val">--</div>
+</div>
+<div id="c-side" class="card safe">
+<div class="lbl">SIDE (ToF)</div>
+<div id="v-side" class="val">--</div>
+</div>
+</div>
+
+<div id="joy-zone"><div id="joy-knob"></div></div>
+
+<div class="rpm">
+L: <span id="r1">0</span> | R: <span id="r2">0</span>
+</div>
+
+<button onclick="sendCommand('auto_start')">AUTO FORWARD (Reactive)</button>
+<button onclick="sendCommand('auto_stop')">STOP AUTO</button>
+
+<script>
+var zone = document.getElementById("joy-zone");
+var knob = document.getElementById("joy-knob");
+var maxR = 80;
+var rect, cx, cy, drag=false, lastT=0;
+
+function setRect(){ rect=zone.getBoundingClientRect(); cx=rect.width/2; cy=rect.height/2; }
+setRect(); window.onresize=setRect;
+
+function start(e){ drag=true; e.preventDefault(); }
+function end(){ drag=false; knob.style.transform="translate(-50%,-50%)"; send(0,0); }
+function move(e){
+if(!drag)return; e.preventDefault();
+var tx=e.touches?e.touches[0].clientX:e.clientX;
+var ty=e.touches?e.touches[0].clientY:e.clientY;
+var x=tx-rect.left-cx; var y=ty-rect.top-cy;
+var d=Math.sqrt(x*x+y*y);
+if(d>maxR){ var a=Math.atan2(y,x); x=Math.cos(a)*maxR; y=Math.sin(a)*maxR; }
+knob.style.transform=`translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+
+if(Date.now()-lastT>100){
+send(Math.round(x/maxR*100), Math.round(y/maxR*-100));
+lastT=Date.now();
+}
+}
+
+zone.addEventListener("mousedown",start); zone.addEventListener("touchstart",start);
+document.addEventListener("mousemove",move); document.addEventListener("touchmove",move);
+document.addEventListener("mouseup",end); document.addEventListener("touchend",end);
+
+function sendCommand(cmd){ fetch('/'+cmd); } 
+
+function send(x,y){ fetch("/joy?x="+x+"&y="+y); }
+
+setInterval(()=>{
+fetch("/data").then(r=>r.json()).then(d=>{
+document.getElementById("v-front").innerText = d.f.toFixed(1);
+document.getElementById("v-side").innerText = d.s.toFixed(1);
+document.getElementById("r1").innerText = d.m1.toFixed(1);
+document.getElementById("r2").innerText = d.m2.toFixed(1);
+
+document.getElementById("c-front").className = d.f < 20.0 ? "card danger" : "card safe";
+document.getElementById("c-side").className = d.s < 16.0 ? "card danger" : "card safe";
+});
+}, 200);
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot(){ server.send(200,"text/html",index_html); }
+
+// 自动模式开始：进入 NAV_STATE_FORWARD
+void handleAutoStart() {
+  if (nav_state == NAV_STATE_STOP) {
+    nav_state = NAV_STATE_FORWARD;
+    pid1.reset(); 
+    pid2.reset(); 
+    wall_last_time = millis();
+  }
+  server.send(200, "text/plain", "Auto Mode Started");
+}
+
+// 自动模式停止：进入 NAV_STATE_STOP
+void handleAutoStop() {
+  nav_state = NAV_STATE_STOP;
+  target_rpm_m1 = 0.0;
+  target_rpm_m2 = 0.0;
+  pid1.reset(); 
+  pid2.reset(); 
+  wall_last_error = 0.0;
+  server.send(200, "text/plain", "Auto Mode Stopped");
+}
+
+// 摇杆：一旦动摇杆就退出自动模式
+void handleJoy(){
+  if (nav_state != NAV_STATE_STOP) {
+    nav_state = NAV_STATE_STOP;
+    target_rpm_m1 = 0.0;
+    target_rpm_m2 = 0.0;
+    pid1.reset(); 
+    pid2.reset(); 
+    wall_last_error = 0.0;
+  }
+    
+  if(server.hasArg("x")){
+    int x = server.arg("x").toInt();
+    int y = server.arg("y").toInt();
+        
+    if(obs_front && y > 0) y = 0;
+
+    float left  = (float)y + (float)x;
+    float right = (float)y - (float)x;
+    float m = max(abs(left), abs(right));
+    if(m > 100) { left = left/m*100; right = right/m*100; }
+        
+    target_rpm_m1 = (left  / 100.0) * MAX_SPEED_RPM;
+    target_rpm_m2 = (right / 100.0) * MAX_SPEED_RPM;
+
+    if (x==0 && y==0) { pid1.reset(); pid2.reset(); }
+        
+    server.send(200,"text/plain","OK");
+  }
+}
+
+void handleData(){
+  String json="{";
+  json+="\"f\":"+String(val_front)+",";
+  json+="\"s\":"+String(val_side)+",";
+  json+="\"m1\":"+String(current_rpm1, 1)+","; 
+  json+="\"m2\":"+String(current_rpm2, 1);     
+  json+="}";
+  server.send(200,"application/json",json);
+}
+
+// ===================== 6. Setup & Loop =====================
+void setup() {
+  Serial.begin(115200);
+
+  // 1. 电机和编码器引脚配置
+  pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP); 
+  pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP); 
+  pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
+    
+  // PWM 引脚绑定
+  ledcAttach(M1_RPWM_PIN, 20000, 8); 
+  ledcAttach(M1_LPWM_PIN, 20000, 8);
+  ledcAttach(M2_RPWM_PIN, 20000, 8); 
+  ledcAttach(M2_LPWM_PIN, 20000, 8);
+
+  // 2. WiFi AP
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  WiFi.softAP(ssid, password);
+  server.on("/",        handleRoot);
+  server.on("/joy",     handleJoy);
+  server.on("/data",    handleData);
+  server.on("/auto_start", handleAutoStart); 
+  server.on("/auto_stop",  handleAutoStop);   
+  server.begin();
+
+  // 3. 初始化 I2C & 两个 ToF
+  Wire.begin(MY_SDA, MY_SCL);
+  Wire.setClock(100000);
+
+  pinMode(XSHUT_FRONT, OUTPUT);
+  pinMode(XSHUT_SIDE,  OUTPUT);
+
+  // 先拉低两个 XSHUT 关闭芯片
+  digitalWrite(XSHUT_FRONT, LOW);
+  digitalWrite(XSHUT_SIDE,  LOW);
+  delay(100);
+
+  // --- 初始化前向 ToF ---
+  digitalWrite(XSHUT_FRONT, HIGH);
+  delay(100);
+  if (!tofFront.init()) {
+    Serial.println("Failed to detect and initialize FRONT ToF!");
+    while (1);
+  }
+  tofFront.setAddress(ADDR_FRONT);
+  tofFront.setTimeout(500);
+  setLongRange(&tofFront);
+  Serial.print("Front ToF initialized at 0x");
+  Serial.println(ADDR_FRONT, HEX);
+
+  // --- 初始化右侧 ToF ---
+  digitalWrite(XSHUT_SIDE, HIGH);
+  delay(100);
+  if (!tofSide.init()) {
+    Serial.println("Failed to detect and initialize SIDE ToF!");
+    while (1);
+  }
+  tofSide.setAddress(ADDR_SIDE);
+  tofSide.setTimeout(500);
+  setLongRange(&tofSide);
+  Serial.print("Side ToF initialized at 0x");
+  Serial.println(ADDR_SIDE, HEX);
+
+  Serial.println("Dual ToF ready.");
+}
+
+void loop() {
+  server.handleClient();
+    
+  unsigned long now = millis();
+
+  // ==========================================================
+  // 传感器读取：两个 ToF
+  // ==========================================================
+  // 前向 ToF
+  uint16_t dist_front_mm = tofFront.readRangeSingleMillimeters();
+  if (!tofFront.timeoutOccurred()) {
+    val_front = dist_front_mm / 10.0;  // mm -> cm
+  } else {
+    val_front = -1.0;
+  }
+  obs_front = (val_front > 0 && val_front < OBSTACLE_THRESHOLD_CM);
+
+  // 右侧 ToF（循墙用）
+  uint16_t dist_side_mm = tofSide.readRangeSingleMillimeters();
+  if (!tofSide.timeoutOccurred()) {
+    val_side = dist_side_mm / 10.0;    // mm -> cm
+  } else {
+    val_side = -1.0;
+  }
+
+  // 【导航逻辑】
+  if (nav_state != NAV_STATE_STOP) {
+    runNavigationLogic(); 
+  }
+    
+  // ================== PID 控制循环 (每 100ms) ==================
+  if (millis() - last_PID_time >= PID_INTERVAL_MS) {
+    float dt = (millis() - last_PID_time) / 1000.0;
+        
+    // 1. 读取编码器和计算 RPM
+    noInterrupts(); 
+    long p1 = M1_duration; M1_duration = 0; 
+    long p2 = M2_duration; M2_duration = 0; 
+    interrupts();
+        
+    current_rpm1 = (p1 / COUNTS_PER_REV) * 60.0 / dt;
+    current_rpm2 = (p2 / COUNTS_PER_REV) * 60.0 / dt;
+        
+    // 2. 计算 PWM
+    if (abs(target_rpm_m1) > 0.1) pwm1 = pid1.compute(target_rpm_m1, current_rpm1, dt);
+    else                          pwm1 = 0;
+    if (abs(target_rpm_m2) > 0.1) pwm2 = pid2.compute(target_rpm_m2, current_rpm2, dt);
+    else                          pwm2 = 0;
+
+    // 3. 设置电机 PWM
+    set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, pwm1);
+    set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, pwm2);
+        
+    last_PID_time = millis();
+  }
+}
