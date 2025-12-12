@@ -1,0 +1,215 @@
+//tof 网页
+// #include <Arduino.h>
+// #include <WiFi.h>
+// #include <WebServer.h>
+// #include <math.h>
+// #include <Wire.h>
+// #include <Adafruit_VL53L0X.h>
+
+// // ===================== WiFi & WebServer 配置 =====================
+// const char *ssid      = "ToF_Monitor";
+// const char *password = "12345678";
+// WebServer server(80);
+
+// // ===================== ToF 传感器配置 =====================
+// #define MY_SDA 8
+// #define MY_SCL 9
+// #define XSHUT_FRONT 11
+// #define XSHUT_SIDE  10
+// #define ADDR_FRONT 0x2A
+// #define ADDR_SIDE  0x2B
+
+// Adafruit_VL53L0X tofFront = Adafruit_VL53L0X();
+// Adafruit_VL53L0X tofSide = Adafruit_VL53L0X();
+
+// float val_front = -1.0f;
+// float val_side  = -1.0f;
+
+// enum ToFState { 
+//     TOF_IDLE, 
+//     TOF_START_FRONT, 
+//     TOF_WAIT_FRONT, 
+//     TOF_START_SIDE, 
+//     TOF_WAIT_SIDE 
+// };
+// static ToFState tof_state = TOF_IDLE; 
+
+// // ===================== ToF 异步读取函数 =====================
+// static inline void updateToF_NonBlocking() {
+//     static unsigned long last_tof_cycle_time = 0;
+//     unsigned long now = millis();
+//     const unsigned long TOF_CYCLE_INTERVAL = 50;
+
+//     uint16_t dist_mm;
+    
+//     if (tof_state == TOF_WAIT_FRONT) {
+//         if (tofFront.isRangeComplete()) {
+//             dist_mm = tofFront.readRange(); 
+//             val_front = (dist_mm > 50 && dist_mm < 8000) ? dist_mm / 10.0f : -1.0f;
+//             tof_state = TOF_START_SIDE;
+//         }
+//     } else if (tof_state == TOF_WAIT_SIDE) {
+//         if (tofSide.isRangeComplete()) {
+//             dist_mm = tofSide.readRange();
+//             val_side = (dist_mm > 50 && dist_mm < 8000) ? dist_mm / 10.0f : -1.0f;
+//             tof_state = TOF_START_FRONT;
+//         }
+//     }
+
+//     if (now - last_tof_cycle_time < TOF_CYCLE_INTERVAL) {
+//         return; 
+//     }
+//     last_tof_cycle_time = now;
+
+//     if (tof_state == TOF_START_FRONT) {
+//         tofFront.startRange(); 
+//         tof_state = TOF_WAIT_FRONT;
+//     } else if (tof_state == TOF_START_SIDE) {
+//         tofSide.startRange(); 
+//         tof_state = TOF_WAIT_SIDE;
+//     } else if (tof_state == TOF_IDLE) {
+//         tof_state = TOF_START_FRONT;
+//     }
+// }
+
+// // ===================== Web Handlers =====================
+// const char index_html[] PROGMEM = R"rawliteral(
+// <!doctype html><html>
+// <head>
+// <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+// <meta charset="utf-8">
+// <title>ToF Monitor</title>
+// <style>
+//   body{font-family:Arial,'Microsoft YaHei';text-align:center;margin:20px;background:#f0f0f0}
+//   h2{color:#333}
+//   .card{background:white;padding:20px;margin:10px auto;border-radius:10px;box-shadow:0 4px 8px rgba(0,0,0,0.1);max-width:300px;}
+//   .val{font-size:24px;font-weight:bold;color:#007bff;font-family:monospace;}
+// </style>
+// </head>
+// <body>
+// <h2>双 ToF 距离监测 (cm)</h2>
+
+// <div class="card">
+//   <h3>前方传感器</h3>
+//   <div id="tf" class="val">--</div>
+// </div>
+
+// <div class="card">
+//   <h3>侧方传感器</h3>
+//   <div id="ts" class="val">--</div>
+// </div>
+
+// <script>
+// setInterval(function(){
+//   var xhr=new XMLHttpRequest();
+//   xhr.onreadystatechange=function(){
+//     if(this.readyState==4 && this.status==200){
+//       var j=JSON.parse(this.responseText);
+//       document.getElementById("tf").innerText = (j.tf > 0) ? j.tf.toFixed(1) + ' cm' : '---';
+//       document.getElementById("ts").innerText = (j.ts > 0) ? j.ts.toFixed(1) + ' cm' : '---';
+//     }
+//   };
+//   xhr.open("GET","/data",true);
+//   xhr.send();
+// },200);
+// </script>
+// </body></html>
+// )rawliteral";
+
+// static inline void handleRoot() {
+//   server.send(200, "text/html; charset=utf-8", index_html);
+// }
+
+// static inline void handleData() {
+//   String json = "{";
+//   json += "\"tf\":"  + String(val_front);
+//   json += ",\"ts\":"  + String(val_side);
+//   json += "}";
+//   server.send(200, "application/json", json);
+// }
+
+
+// // ===================== ToF 初始化辅助函数 =====================
+// bool initSensor(Adafruit_VL53L0X* sensor, int xshutPin, uint8_t addr, const char* name) {
+//   // 传感器已经在外层被复位
+//   pinMode(xshutPin, OUTPUT);
+//   digitalWrite(xshutPin, HIGH);
+//   delay(120); // 确保传感器启动
+
+//   if (!sensor->begin()) {
+//     Serial.print("Failed to init "); Serial.println(name);
+//     return false;
+//   }
+  
+//   // 更改地址
+//   sensor->setAddress(addr);
+//   sensor->setMeasurementTimingBudgetMicroSeconds(50000); // 50ms 预算
+  
+//   Serial.print(name); Serial.print(" initialized at 0x"); Serial.println(addr, HEX);
+//   return true;
+// }
+
+// // ===================== Setup =====================
+// void setup() {
+//   Serial.begin(115200);
+//   delay(100);
+
+//   // --- WiFi AP Setup ---
+//   WiFi.mode(WIFI_AP);
+//   int wifi_channel = 6;
+//   bool success = WiFi.softAP(ssid, password, wifi_channel);
+
+//   if (success) {
+//       Serial.println("\n✅ WiFi AP 启动成功!");
+//       Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+//       Serial.print("Channel: "); Serial.println(WiFi.channel());
+//   } else {
+//       Serial.println("\n❌ FATAL ERROR: WiFi AP 启动失败!");
+//   }
+
+//   server.on("/", handleRoot);
+//   server.on("/data", handleData);
+//   server.begin();
+
+//   // --- I2C Bus Setup (ToF) ---
+//   Wire.begin(MY_SDA, MY_SCL); // 初始化 I2C0
+//   Wire.setClock(50000); // ⭐ 修正：降低 I2C 速度到 50 kHz
+  
+//   // --- ToF 传感器初始化 ---
+//   Serial.println("--- Starting Dual ToF Init ---");
+  
+//   // 1. 复位所有传感器
+//   pinMode(XSHUT_FRONT, OUTPUT);
+//   pinMode(XSHUT_SIDE, OUTPUT);
+//   digitalWrite(XSHUT_FRONT, LOW);
+//   digitalWrite(XSHUT_SIDE, LOW);
+//   delay(100);
+
+//   // 2. 顺序初始化两个传感器
+//   bool init_front = initSensor(&tofFront, XSHUT_FRONT, ADDR_FRONT, "Front ToF");
+//   bool init_side = initSensor(&tofSide, XSHUT_SIDE, ADDR_SIDE, "Side ToF");
+
+//   if (!init_front || !init_side) {
+//     Serial.println("❌ ToF 系统至少一个初始化失败，读数将为 ---");
+//     // 如果失败，强制 tof_state 保持 IDLE，不进行 loop 更新。
+//     tof_state = TOF_IDLE; 
+//   } else {
+//     Serial.println("✅ ToF 系统初始化成功. 启动测量周期.");
+//     // 启动第一个测量周期
+//     tof_state = TOF_START_FRONT; 
+//   }
+// }
+
+// // ===================== Loop =====================
+// void loop() {
+//   // 1. WebServer 必须频繁调用 (非阻塞)
+//   server.handleClient();
+  
+//   // 2. ToF 传感器异步更新 (非阻塞)
+//   if (tof_state != TOF_IDLE) {
+//       updateToF_NonBlocking();
+//   }
+  
+//   // 3. 极短延迟 (可选)
+//   delay(1); 
+// }
