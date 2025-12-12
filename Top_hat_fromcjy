@@ -1,0 +1,156 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+// ========== I2C ==========
+#define I2C_SLAVE_ADDR 0x28
+#define SDA_PIN 43
+#define SCL_PIN 44
+#define COMM_INTERVAL_MS 500
+
+// ========== WiFi AP + Web ==========
+const char *AP_SSID = "ESP32_Joystick_Car";
+const char *AP_PASS = "12345678";
+WebServer server(80);
+
+// 你把自己网页 HTML 放这里（保留你原来的内容即可）
+static const char PAGE_HTML[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Page</title></head><body>
+<h3>ESP32 Web</h3>
+<p>Open /stats to see counters.</p>
+</body></html>
+)rawliteral";
+
+// ========== Counters (用“HTTP请求数”近似“网页产生的数据包数”) ==========
+volatile uint32_t http_req_total = 0;
+volatile uint32_t http_req_window = 0;   // 发送给从机的“本周期请求数”
+volatile uint32_t i2c_tx_total = 0;
+
+volatile int run_flag = 1;
+unsigned long previousMillis = 0;
+
+static inline void count_http_request() {
+  http_req_total++;
+  http_req_window++;
+}
+
+// 停机（你自己把电机停转代码写进来）
+void stop_all_motors() {
+  Serial.println("ROBOT MOVEMENT DISABLED.");
+}
+
+void send_I2C_byte(uint8_t data) {
+  Wire.beginTransmission(I2C_SLAVE_ADDR);
+  Wire.write(data);
+  uint8_t error = Wire.endTransmission();
+
+  if (error == 0) {
+    i2c_tx_total++;
+    Serial.printf("[%lu ms] I2C TX OK: 0x%02X (%u)\n", millis(), data, data);
+  } else {
+    Serial.printf("[%lu ms] I2C TX ERROR %d (No ACK)\n", millis(), error);
+  }
+}
+
+uint8_t receive_I2C_byte() {
+  Wire.requestFrom(I2C_SLAVE_ADDR, (uint8_t)1);
+
+  if (Wire.available() < 1) {
+    Serial.printf("[%lu ms] I2C RX FAIL (0 bytes) -> FAIL-SAFE STOP\n", millis());
+    run_flag = 0;
+    stop_all_motors();
+    return 0;
+  }
+
+  uint8_t hp = Wire.read();
+  Serial.printf("Received HP: 0x%02X (%d HP) ", hp, hp);
+
+  if (hp == 0x00) {
+    if (run_flag != 0) Serial.println("-> STATUS: DEAD");
+    run_flag = 0;
+    stop_all_motors();
+  } else {
+    if (run_flag != 1) Serial.println("-> STATUS: ALIVE");
+    run_flag = 1;
+  }
+  return hp;
+}
+
+// ========== Web handlers ==========
+void handleRoot() {
+  count_http_request();
+  server.send(200, "text/html", PAGE_HTML);
+}
+
+void handleStats() {
+  count_http_request();
+  String s;
+  s.reserve(160);
+  s += "{";
+  s += "\"http_total\":" + String(http_req_total) + ",";
+  s += "\"http_window\":" + String(http_req_window) + ",";
+  s += "\"i2c_tx_total\":" + String(i2c_tx_total) + ",";
+  s += "\"run_flag\":" + String(run_flag);
+  s += "}";
+  server.send(200, "application/json", s);
+}
+
+void handleNotFound() {
+  count_http_request();
+  server.send(404, "text/plain", "404");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // I2C (低速更稳)
+  Wire.begin(SDA_PIN, SCL_PIN, 40000);
+
+  // WiFi AP + WebServer
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  delay(50);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/stats", HTTP_GET, handleStats);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  Serial.println("----------------------------------------");
+  Serial.println("ESP32 I2C Master + WebServer START");
+  Serial.printf("AP: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  Serial.printf("I2C SDA: %d, SCL: %d, SLAVE: 0x%02X\n", SDA_PIN, SCL_PIN, I2C_SLAVE_ADDR);
+  Serial.println("----------------------------------------");
+}
+
+void loop() {
+  // 处理网页请求（每来一次请求就会累计 http_req_window）
+  server.handleClient();
+
+  unsigned long currentMillis = millis();
+
+  if (currentMillis - previousMillis >= COMM_INTERVAL_MS) {
+    previousMillis = currentMillis;
+
+    // 1) 取“本周期HTTP请求数”作为 WiFi packet usage 的近似值（0~255）
+    uint32_t pk = http_req_window;
+    http_req_window = 0;
+    uint8_t pk_byte = (pk > 255) ? 255 : (uint8_t)pk;
+
+    // 2) 发给从机
+    Serial.printf("[%lu ms] WIFI_PK(window)=%lu -> send 0x%02X\n", millis(), pk, pk_byte);
+    send_I2C_byte(pk_byte);
+
+    // 3) 从机回 HP 并更新 run_flag
+    receive_I2C_byte();
+
+    // 4) 打印 run_flag
+    Serial.printf("-> RUN_FLAG: %d\n", run_flag);
+    Serial.println("----------------------------------------");
+  }
+
+  // 你自己的控制逻辑（示例）
+  // if (run_flag == 1) { ... } else { stop_all_motors(); }
+}
