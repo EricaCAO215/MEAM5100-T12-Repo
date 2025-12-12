@@ -1,7 +1,7 @@
-ESP32-C3 I2C Master Code
-test code writes and receives
+//ESP32-C3 I2C Master Code
+//test code writes and receives
 
-满血是0x64
+//满血是0x64
 #include <Wire.h>
 
 #define I2C_SLAVE_ADDR 0x28
