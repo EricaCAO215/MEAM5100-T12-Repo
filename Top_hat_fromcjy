@@ -19,16 +19,18 @@ volatile int run_flag = 1;
 unsigned long previousMillis = 0;
 
 // ===================== “发包”统计：只统计用户操作 =====================
-// 只有用户按按钮/触发cmd才算“扣血包”
 volatile uint32_t wifi_packets_window = 0;
 
-// ===================== Motor Stub（你需要自己换成真实电机控制） =====================
+// 只有网页JS会带这个 key，系统后台请求不会带
+static const char *ACTION_KEY = "5100";
+
+// ===================== Motor Stub（你换成真实电机控制） =====================
 void stop_all_motors() {
   Serial.println("ROBOT MOVEMENT DISABLED.");
-  // TODO: 在这里写真实停电机（PWM=0 / 刹车等）
+  // TODO: stop motors here
 }
 
-// ===================== I2C Master (保持你第一份串口风格) =====================
+// ===================== I2C Master (保留你第一份串口风格) =====================
 void send_I2C_byte(uint8_t data) {
   Wire.beginTransmission(I2C_SLAVE_ADDR);
   Wire.write(data);
@@ -46,9 +48,8 @@ uint8_t receive_I2C_byte() {
   uint8_t current_health_hp = 0;
 
   if (bytesReceived > 0) {
-    while (Wire.available()) {
-      current_health_hp = Wire.read();
-    }
+    while (Wire.available()) current_health_hp = Wire.read();
+
     Serial.printf("Received HP: 0x%02X (%d HP) ", current_health_hp, current_health_hp);
 
     if (current_health_hp == 0x00) {
@@ -66,12 +67,15 @@ uint8_t receive_I2C_byte() {
   return current_health_hp;
 }
 
-// ===================== 用户操作计数（只有这里会扣血） =====================
+// ===================== 只在“真实用户操作”时计数 =====================
+static inline bool is_user_action_request() {
+  return server.hasArg("k") && server.arg("k") == ACTION_KEY;
+}
 static inline void count_user_action_packet() {
   wifi_packets_window++;
 }
 
-// ===================== Web UI (按钮页面) =====================
+// ===================== Web UI (按钮页面，无轮询) =====================
 const char index_html[] PROGMEM = R"rawliteral(
 <!doctype html><html>
 <head>
@@ -106,10 +110,12 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 <div class="info">
   <div>Last cmd: <span id="c">-</span></div>
-  <div>Status: <span id="st">-</span></div>
+  <div>Resp: <span id="st">-</span></div>
 </div>
 
 <script>
+const KEY = "5100"; // 必须和后端 ACTION_KEY 一致
+
 function send(c){
   document.getElementById("c").innerText=c;
   var xhr=new XMLHttpRequest();
@@ -118,7 +124,7 @@ function send(c){
       document.getElementById("st").innerText=this.status + " " + this.responseText;
     }
   };
-  xhr.open("GET","/cmd?c="+c,true);
+  xhr.open("GET","/cmd?c="+c+"&k="+KEY,true);
   xhr.send();
 }
 </script>
@@ -126,40 +132,43 @@ function send(c){
 )rawliteral";
 
 // ===================== Web Handlers =====================
-// 注意：/ 和 /status 不计数！只在 /cmd 计数！
-
+// / 和各种探测请求：都不计数，不扣血
 void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html; charset=utf-8", index_html);
 }
 
-void handleStatus() {
-  // 不扣血，只给你看状态
-  String s = "RUN_FLAG=" + String(run_flag);
-  server.send(200, "text/plain", s);
-}
+// 常见系统探测（不扣血）
+void handle204() { server.send(204, "text/plain", ""); }                 // Android
+void handleHotspotDetect() { server.send(200, "text/html", "OK"); }      // iOS/macOS
+void handleConnectTest() { server.send(200, "text/plain", "Microsoft"); }// Windows
+void handleFavicon() { server.send(204, "image/x-icon", ""); }           // favicon
 
+// 只在 /cmd 且带 key 才计数扣血
 void handleCmd() {
-  // ✅ 只有用户按按钮才算“发包/扣血”
-  count_user_action_packet();
-
   char c = 'S';
   if (server.hasArg("c") && server.arg("c").length() > 0) c = server.arg("c")[0];
 
-  // DEAD 强制 stop（不管用户按啥）
+  // ✅ 只有网页JS带 k=5100 才计数
+  if (is_user_action_request()) {
+    count_user_action_packet();
+  }
+
+  // DEAD 强制 stop
   if (run_flag == 0) {
     stop_all_motors();
     server.send(200, "text/plain", "DEAD");
     return;
   }
 
-  // TODO: 你在这里写真实动作（电机控制）
-  // 现在先回显命令，方便测试
+  // TODO: 在这里写真实电机动作
   // if(c=='F'){...} else if(c=='B'){...} else if(c=='L'){...} else if(c=='R'){...} else {stop...}
 
   server.send(200, "text/plain", String(c));
 }
 
 void handleNotFound() {
+  // 不扣血
   server.send(404, "text/plain", "404");
 }
 
@@ -174,7 +183,13 @@ void setup() {
 
   server.on("/", handleRoot);
   server.on("/cmd", handleCmd);
-  server.on("/status", handleStatus);
+
+  // 常见联网探测路径（全都不扣血）
+  server.on("/generate_204", handle204);
+  server.on("/hotspot-detect.html", handleHotspotDetect);
+  server.on("/connecttest.txt", handleConnectTest);
+  server.on("/favicon.ico", handleFavicon);
+
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -193,7 +208,6 @@ void loop() {
   if (currentMillis - previousMillis >= COMM_INTERVAL_MS) {
     previousMillis = currentMillis;
 
-    // 只上报“用户操作次数”
     uint32_t pk = wifi_packets_window;
     wifi_packets_window = 0;
     uint8_t pk_byte = (pk > 255) ? 255 : (uint8_t)pk;
@@ -207,4 +221,3 @@ void loop() {
     Serial.println("----------------------------------------");
   }
 }
-
