@@ -1,0 +1,840 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "vive510.h"
+#include <math.h>
+#include <Wire.h>
+
+// ======================================================
+// 0) MedianFilter 必须放在 filterViveValue 之前（关键修复）
+// ======================================================
+const int   WINDOW_SIZE = 5;
+const float OUTLIER_THRESHOLD = 500.0f;
+
+class MedianFilter {
+  public:
+    uint16_t history[WINDOW_SIZE];
+    int head = 0;
+    int count = 0;
+
+    MedianFilter() {
+      for (int i=0;i<WINDOW_SIZE;i++) history[i] = 0;
+    }
+
+    void add(uint16_t v) {
+      history[head] = v;
+      head = (head + 1) % WINDOW_SIZE;
+      if (count < WINDOW_SIZE) count++;
+    }
+
+    uint16_t median() {
+      if (count == 0) return 0;
+      uint16_t tmp[WINDOW_SIZE];
+      for (int i=0;i<count;i++) tmp[i] = history[i];
+      for (int i=0;i<count-1;i++) {
+        for (int j=i+1;j<count;j++) {
+          if (tmp[j] < tmp[i]) {
+            uint16_t t = tmp[i]; tmp[i]=tmp[j]; tmp[j]=t;
+          }
+        }
+      }
+      return tmp[count/2];
+    }
+};
+
+static inline bool filterViveValue(uint16_t val, MedianFilter &f) {
+  if (f.count < 3) {
+    f.add(val);
+    return true;
+  }
+  uint16_t med = f.median();
+  if (abs((long)val - (long)med) > OUTLIER_THRESHOLD) return false;
+  f.add(val);
+  return true;
+}
+
+// ===================== 用户配置区 =====================
+#define INVERT_M1_ENCODER false
+#define INVERT_M2_ENCODER true   // 右轮反接修正
+
+const char *ssid     = "ESP32_Joystick_Car";
+const char *password = "12345678";
+
+// ===================== PID 参数 =====================
+float Kp1 = 3.0,  Ki1 = 0.0, Kd1 = 0.1;
+float Kp2 = 2.93, Ki2 = 0.0, Kd2 = 0.1;
+
+// 最大速度限制 (RPM)
+const float MAX_SPEED_RPM = 80.0;
+
+// ===================== 编码器 / 时间参数 =====================
+const float COUNTS_PER_REV = 4480.0;
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+const int SAMPLE_TIME_MS = 100;
+
+volatile float target_rpm_m1 = 0.0;
+volatile float target_rpm_m2 = 0.0;
+
+float current_rpm1 = 0;
+float current_rpm2 = 0;
+int pwm1 = 0;
+int pwm2 = 0;
+
+// ===================== 简单 PID 类 =====================
+class SimplePID {
+  public:
+    float kp, ki, kd;
+    float integral = 0;
+    float prev_error = 0;
+
+    SimplePID(float p, float i, float d) : kp(p), ki(i), kd(d) {}
+
+    int compute(float target, float current, float dt) {
+      float error = target - current;
+      integral += error * dt;
+      integral = constrain(integral, -255.0f, 255.0f);
+      float derivative = (dt > 1e-6f) ? ((error - prev_error) / dt) : 0.0f;
+      prev_error = error;
+      float output = (kp * error) + (ki * integral) + (kd * derivative);
+      return (int)constrain(output, -255, 255);
+    }
+
+    void reset() {
+      integral = 0;
+      prev_error = 0;
+    }
+};
+
+SimplePID pid1(Kp1, Ki1, Kd1);
+SimplePID pid2(Kp2, Ki2, Kd2);
+
+// ===================== 电机与编码器定义 =====================
+const int M1_ENCODER_A_PIN = 7;
+const int M1_ENCODER_B_PIN = 3;
+const int M1_RPWM_PIN      = 33;
+const int M1_LPWM_PIN      = 38;
+volatile long M1_duration  = 0;
+volatile int  M1_encoder0PinALast = LOW;
+
+const int M2_ENCODER_A_PIN = 18;
+const int M2_ENCODER_B_PIN = 14;
+const int M2_RPWM_PIN      = 6;
+const int M2_LPWM_PIN      = 5;
+volatile long M2_duration  = 0;
+volatile int  M2_encoder0PinALast = LOW;
+
+WebServer server(80);
+
+// ===================== Vive 定义（单 Vive + 滤波） =====================
+#define SIGNALPIN 12
+Vive510 vive(SIGNALPIN);
+
+uint16_t vive_x = 0, vive_y = 0;
+bool vive_valid = false;
+
+MedianFilter filterX;
+MedianFilter filterY;
+
+// 机器人位姿估计
+float robot_rx = 0.0f, robot_ry = 0.0f;
+float robot_theta_deg = 0.0f;
+bool  robot_pose_valid = false;
+
+float headingRad = 0.0f;
+bool heading_initialized = false;
+float last_rx = 0.0f, last_ry = 0.0f;
+
+// ===================== Go-To 目标点控制 =====================
+float target_x = 0.0f, target_y = 0.0f;
+bool goto_active = false;
+
+const float GOTO_DIST_EPS   = 50.0f;
+const float GOTO_SLOW_DIST  = 400.0f;
+const float MIN_GOTO_SPEED  = 25.0f;
+const float KW              = 2.0f;
+
+// ===================== Waypoints =====================
+const int   MAX_WP = 3;
+float wp_x[MAX_WP];
+float wp_y[MAX_WP];
+int   wp_count = 0;
+int   wp_idx   = 0;
+bool  wp_active = false;
+
+// ===================== TopHat I2C（血量） =====================
+#define I2C_SLAVE_ADDR      0x28
+#define SDA_PIN             43
+#define SCL_PIN             44
+#define COMM_INTERVAL_MS    500   // 2 Hz
+
+volatile int run_flag = 1;
+unsigned long previousMillis = 0;
+
+// 只统计用户操作次数（扣血包）
+volatile uint32_t wifi_packets_window = 0;
+
+static inline void count_user_action_packet() {
+  wifi_packets_window++;
+}
+
+// ===================== Servo 攻击臂（保持扫动行为） =====================
+#define SERVO_PIN 1
+#define SERVO_FREQ_HZ   50
+#define SERVO_RES_BITS  10
+#define SERVO_MAX_DUTY  ((1 << SERVO_RES_BITS) - 1)
+
+static inline uint32_t angleToDuty(int angle) {
+  float pulse_ms   = 0.5f + (angle / 180.0f) * 2.0f;
+  float duty_ratio = pulse_ms / 20.0f;
+  return (uint32_t)(duty_ratio * SERVO_MAX_DUTY);
+}
+
+// 非阻塞扫动（等价于你原来两个for + delay(15)）
+static inline void servoSweepTask() {
+  static int a = 20;
+  static int dir = +1;
+  static unsigned long last = 0;
+  if (millis() - last < 15) return;
+  last = millis();
+
+  ledcWrite(SERVO_PIN, angleToDuty(a));
+  a += dir * 3;
+  if (a >= 120) { a = 120; dir = -1; }
+  if (a <= 20)  { a = 20;  dir = +1; }
+}
+
+// ===================== 立即停（电机 + 状态） =====================
+static inline void hardStopNow() {
+  goto_active = false;
+  wp_active = false;
+  target_rpm_m1 = 0.0f;
+  target_rpm_m2 = 0.0f;
+  pid1.reset();
+  pid2.reset();
+
+  ledcWrite(M1_LPWM_PIN, 0);
+  ledcWrite(M1_RPWM_PIN, 0);
+  ledcWrite(M2_LPWM_PIN, 0);
+  ledcWrite(M2_RPWM_PIN, 0);
+}
+
+static inline void stop_all_motors() {
+  Serial.println("ROBOT MOVEMENT DISABLED.");
+  hardStopNow();
+}
+
+static inline void startSingleGoto(float x, float y) {
+  wp_active = false;
+  wp_count = 0;
+  wp_idx = 0;
+  target_x = x;
+  target_y = y;
+  goto_active = true;
+}
+
+static inline void startWaypointRun() {
+  if (wp_count <= 0) return;
+  wp_idx = 0;
+  wp_active = true;
+  target_x = wp_x[0];
+  target_y = wp_y[0];
+  goto_active = true;
+}
+
+static inline void advanceWaypoint() {
+  wp_idx++;
+  if (wp_idx >= wp_count) {
+    hardStopNow();
+    Serial.println("WAYPOINTS: All done -> STOP.");
+    return;
+  }
+  target_x = wp_x[wp_idx];
+  target_y = wp_y[wp_idx];
+  goto_active = true;
+  Serial.print("WAYPOINTS: Next -> (");
+  Serial.print(target_x);
+  Serial.print(", ");
+  Serial.print(target_y);
+  Serial.println(")");
+}
+
+// ===================== 网页（方向键，不要摇杆） =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!doctype html><html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta charset="utf-8">
+<title>ESP32 Control</title>
+<style>
+  body{font-family:Arial,'Microsoft YaHei';text-align:center;margin:0;padding:12px;touch-action:none}
+  h2{margin:8px 0}
+  .grid{display:grid;grid-template-columns:repeat(3,90px);grid-gap:10px;justify-content:center;margin-top:14px}
+  button{height:54px;font-size:16px;border:none;border-radius:10px;background:#007bff;color:white}
+  button.gray{background:#444}
+  .info{margin-top:12px;font-family:monospace}
+  .box{margin-top:12px;font-size:14px}
+  .box input{width:70px;padding:4px;margin:2px}
+  .box button{height:auto;padding:8px 10px;font-size:14px}
+</style>
+</head>
+<body>
+<h2>⬆⬇⬅➡ 手动 + Vive GOTO/WP + TopHat</h2>
+
+<div class="grid">
+  <div></div>
+  <button onmousedown="send('F')" ontouchstart="send('F')" onmouseup="send('S')" ontouchend="send('S')">↑</button>
+  <div></div>
+
+  <button onmousedown="send('L')" ontouchstart="send('L')" onmouseup="send('S')" ontouchend="send('S')">←</button>
+  <button class="gray" onclick="send('S')">■</button>
+  <button onmousedown="send('R')" ontouchstart="send('R')" onmouseup="send('S')" ontouchend="send('S')">→</button>
+
+  <div></div>
+  <button onmousedown="send('B')" ontouchstart="send('B')" onmouseup="send('S')" ontouchend="send('S')">↓</button>
+  <div></div>
+</div>
+
+<div class="info">
+  <div>RUN_FLAG: <span id="rf">-</span></div>
+  <div>RPM L/R: <span id="rpm1">0</span> / <span id="rpm2">0</span></div>
+  <div>Vive: (<span id="v1x">0</span>, <span id="v1y">0</span>)</div>
+  <div>Pose: X=<span id="rx">0</span>, Y=<span id="ry">0</span>, θ=<span id="th">0</span>°</div>
+</div>
+
+<div class="box">
+  <div><b>Go to (X,Y)</b></div>
+  <input id="tx" type="number" placeholder="X">
+  <input id="ty" type="number" placeholder="Y">
+  <button onclick="sendGoto()">Go</button>
+  <button class="gray" onclick="sendStop()">Stop</button>
+</div>
+
+<div class="box">
+  <div><b>Waypoints (最多 3 个，顺序执行)</b></div>
+  <div><input id="w1x" type="number" placeholder="X1"><input id="w1y" type="number" placeholder="Y1"></div>
+  <div><input id="w2x" type="number" placeholder="X2"><input id="w2y" type="number" placeholder="Y2"></div>
+  <div><input id="w3x" type="number" placeholder="X3"><input id="w3y" type="number" placeholder="Y3"></div>
+  <button onclick="sendWaypoints()">Start Waypoints</button>
+  <button class="gray" onclick="clearWaypoints()">Clear</button>
+</div>
+
+<script>
+function xhrGET(url){
+  var xhr=new XMLHttpRequest();
+  xhr.open("GET",url,true);
+  xhr.send();
+}
+function send(c){ xhrGET("/cmd?c="+c); }
+function sendStop(){ xhrGET("/stop"); }
+
+function sendGoto(){
+  var tx=document.getElementById("tx").value;
+  var ty=document.getElementById("ty").value;
+  if(tx===""||ty==="") return;
+  xhrGET("/goto?x="+tx+"&y="+ty);
+}
+function sendWaypoints(){
+  var w=[];
+  function add(ix,iy){
+    var x=document.getElementById(ix).value;
+    var y=document.getElementById(iy).value;
+    if(x!==""&&y!=="") w.push(x+","+y);
+  }
+  add("w1x","w1y"); add("w2x","w2y"); add("w3x","w3y");
+  if(w.length===0) return;
+  xhrGET("/waypoints?pts="+encodeURIComponent(w.join(";")));
+}
+function clearWaypoints(){ xhrGET("/clearwp"); }
+
+// 键盘方向键：按下发 F/B/L/R，松开发 S
+var keyDown = {};
+document.addEventListener('keydown', function(e){
+  if(keyDown[e.code]) return;
+  keyDown[e.code]=true;
+  if(e.code==="ArrowUp") send('F');
+  else if(e.code==="ArrowDown") send('B');
+  else if(e.code==="ArrowLeft") send('L');
+  else if(e.code==="ArrowRight") send('R');
+});
+document.addEventListener('keyup', function(e){
+  keyDown[e.code]=false;
+  if(e.code==="ArrowUp"||e.code==="ArrowDown"||e.code==="ArrowLeft"||e.code==="ArrowRight") send('S');
+});
+
+setInterval(function(){
+  var xhr=new XMLHttpRequest();
+  xhr.onreadystatechange=function(){
+    if(this.readyState==4 && this.status==200){
+      var j=JSON.parse(this.responseText);
+      document.getElementById("rf").innerText=j.run;
+      document.getElementById("rpm1").innerText=j.m1.toFixed(1);
+      document.getElementById("rpm2").innerText=j.m2.toFixed(1);
+      document.getElementById("v1x").innerText=j.v1x;
+      document.getElementById("v1y").innerText=j.v1y;
+      document.getElementById("rx").innerText=j.rx.toFixed(1);
+      document.getElementById("ry").innerText=j.ry.toFixed(1);
+      document.getElementById("th").innerText=j.th.toFixed(1);
+    }
+  };
+  xhr.open("GET","/data",true);
+  xhr.send();
+},200);
+</script>
+</body></html>
+)rawliteral";
+
+// ===================== 编码器中断 =====================
+void IRAM_ATTR wheelSpeed_M1() {
+  int Lstate = digitalRead(M1_ENCODER_A_PIN);
+  if (Lstate != M1_encoder0PinALast) {
+    int val = digitalRead(M1_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M1_ENCODER) dir = !dir;
+    if (dir) M1_duration++; else M1_duration--;
+  }
+  M1_encoder0PinALast = Lstate;
+}
+
+void IRAM_ATTR wheelSpeed_M2() {
+  int Lstate = digitalRead(M2_ENCODER_A_PIN);
+  if (Lstate != M2_encoder0PinALast) {
+    int val = digitalRead(M2_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M2_ENCODER) dir = !dir;
+    if (dir) M2_duration++; else M2_duration--;
+  }
+  M2_encoder0PinALast = Lstate;
+}
+
+// ===================== 电机驱动 =====================
+static inline void set_motor_pwm(int rpwm_pin, int lpwm_pin, int pwm_val) {
+  if (pwm_val > 0) {
+    ledcWrite(lpwm_pin, 0);
+    ledcWrite(rpwm_pin, pwm_val);
+  } else {
+    ledcWrite(lpwm_pin, abs(pwm_val));
+    ledcWrite(rpwm_pin, 0);
+  }
+}
+
+// ===================== Vive 更新（带滤波） =====================
+static inline void updateVive() {
+  if (vive.status() == VIVE_RECEIVING) {
+    uint16_t x_raw = vive.xCoord();
+    uint16_t y_raw = vive.yCoord();
+
+    bool range_ok = (x_raw > 1000 && x_raw < 8000 &&
+                     y_raw > 1000 && y_raw < 8000);
+
+    if (range_ok) {
+      bool okx = filterViveValue(x_raw, filterX);
+      bool oky = filterViveValue(y_raw, filterY);
+
+      if (okx && oky) {
+        vive_x = filterX.median();
+        vive_y = filterY.median();
+        vive_valid = true;
+        return;
+      }
+    }
+    vive_valid = false;
+  } else {
+    vive_valid = false;
+    vive.sync(5);
+  }
+}
+
+// ===================== TopHat I2C Master（保持你原串口风格） =====================
+static inline void send_I2C_byte(uint8_t data) {
+  Wire.beginTransmission(I2C_SLAVE_ADDR);
+  Wire.write(data);
+  uint8_t error = Wire.endTransmission();
+
+  if (error == 0) {
+    Serial.printf("[%lu ms] SUCCESS: Data sent.\n", millis());
+  } else {
+    Serial.printf("[%lu ms] ERROR %d: Failed to send data to Top Hat (No ACK).\n", millis(), error);
+  }
+}
+
+static inline uint8_t receive_I2C_byte() {
+  uint8_t bytesReceived = Wire.requestFrom(I2C_SLAVE_ADDR, (uint8_t)1);
+  uint8_t current_health_hp = 0;
+
+  if (bytesReceived > 0) {
+    while (Wire.available()) {
+      current_health_hp = Wire.read();
+    }
+    Serial.printf("Received HP: 0x%02X (%d HP) ", current_health_hp, current_health_hp);
+
+    if (current_health_hp == 0x00) {
+      if (run_flag != 0) Serial.println("-> STATUS: DEAD");
+      run_flag = 0;
+      stop_all_motors();
+    } else {
+      if (run_flag != 1) Serial.println("-> STATUS: ALIVE");
+      run_flag = 1;
+    }
+  } else {
+    Serial.println("WARNING: Failed to receive health status (0 bytes received).");
+    return 0;
+  }
+  return current_health_hp;
+}
+
+// ===================== Web Handlers =====================
+static inline void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", index_html);
+}
+
+// 手动方向键：/cmd?c=F/B/L/R/S
+static inline void handleCmd() {
+  // 用户操作 -> 扣血包
+  count_user_action_packet();
+
+  char c = 'S';
+  if (server.hasArg("c") && server.arg("c").length() > 0) c = server.arg("c")[0];
+
+  // DEAD 强制 stop
+  if (run_flag == 0) {
+    stop_all_motors();
+    server.send(200, "text/plain", "DEAD");
+    return;
+  }
+
+  // 一旦手动控制，退出 goto/waypoints
+  goto_active = false;
+  wp_active = false;
+
+  float L = 0.0f, R = 0.0f;
+  if (c == 'F') { L =  MAX_SPEED_RPM; R =  MAX_SPEED_RPM; }
+  else if (c == 'B') { L = -MAX_SPEED_RPM; R = -MAX_SPEED_RPM; }
+  else if (c == 'L') { L = -MAX_SPEED_RPM; R =  MAX_SPEED_RPM; }
+  else if (c == 'R') { L =  MAX_SPEED_RPM; R = -MAX_SPEED_RPM; }
+  else { L = 0.0f; R = 0.0f; pid1.reset(); pid2.reset(); }
+
+  target_rpm_m1 = L;
+  target_rpm_m2 = R;
+
+  server.send(200, "text/plain", String(c));
+}
+
+static inline void handleGoto() {
+  // 用户操作 -> 扣血包
+  count_user_action_packet();
+
+  if (run_flag == 0) { stop_all_motors(); server.send(200, "text/plain", "DEAD"); return; }
+
+  if (server.hasArg("x") && server.hasArg("y")) {
+    float x = server.arg("x").toFloat();
+    float y = server.arg("y").toFloat();
+    startSingleGoto(x, y);
+    Serial.print("GOTO SET -> (");
+    Serial.print(target_x);
+    Serial.print(", ");
+    Serial.print(target_y);
+    Serial.println(")");
+    server.send(200, "text/plain", "GOTO SET");
+  } else {
+    server.send(400, "text/plain", "Missing x/y");
+  }
+}
+
+static inline void handleStop() {
+  // 用户操作 -> 扣血包
+  count_user_action_packet();
+
+  hardStopNow();
+  Serial.println("STOP by user.");
+  server.send(200, "text/plain", "STOP");
+}
+
+// /waypoints?pts=x1,y1;x2,y2;x3,y3
+static inline void handleWaypoints() {
+  // 用户操作 -> 扣血包
+  count_user_action_packet();
+
+  if (run_flag == 0) { stop_all_motors(); server.send(200, "text/plain", "DEAD"); return; }
+
+  if (!server.hasArg("pts")) {
+    server.send(400, "text/plain", "Missing pts");
+    return;
+  }
+
+  String pts = server.arg("pts");
+  pts.trim();
+  if (pts.length() == 0) {
+    server.send(400, "text/plain", "Empty pts");
+    return;
+  }
+
+  wp_count = 0;
+  wp_idx = 0;
+  wp_active = false;
+
+  int start = 0;
+  while (wp_count < MAX_WP) {
+    int sep = pts.indexOf(';', start);
+    String one = (sep >= 0) ? pts.substring(start, sep) : pts.substring(start);
+    one.trim();
+    if (one.length() > 0) {
+      int comma = one.indexOf(',');
+      if (comma > 0) {
+        float x = one.substring(0, comma).toFloat();
+        float y = one.substring(comma + 1).toFloat();
+        wp_x[wp_count] = x;
+        wp_y[wp_count] = y;
+        wp_count++;
+      }
+    }
+    if (sep < 0) break;
+    start = sep + 1;
+  }
+
+  if (wp_count <= 0) {
+    server.send(400, "text/plain", "No valid waypoints");
+    return;
+  }
+
+  startWaypointRun();
+
+  Serial.print("WAYPOINTS SET count=");
+  Serial.print(wp_count);
+  Serial.print(" start=(");
+  Serial.print(target_x);
+  Serial.print(", ");
+  Serial.print(target_y);
+  Serial.println(")");
+
+  server.send(200, "text/plain", "WAYPOINTS START");
+}
+
+static inline void handleClearWP() {
+  // 用户操作 -> 扣血包（你如果想 clear 不扣血，把下一行删掉）
+  count_user_action_packet();
+
+  wp_count = 0;
+  wp_idx = 0;
+  wp_active = false;
+  server.send(200, "text/plain", "WAYPOINTS CLEARED");
+}
+
+static inline void handleData() {
+  // 不扣血，只显示状态
+  String json = "{";
+  json += "\"run\":" + String(run_flag);
+  json += ",\"m1\":"  + String(current_rpm1);
+  json += ",\"m2\":" + String(current_rpm2);
+  json += ",\"v1x\":" + String(vive_x);
+  json += ",\"v1y\":" + String(vive_y);
+  json += ",\"rx\":"  + String(robot_rx, 1);
+  json += ",\"ry\":"  + String(robot_ry, 1);
+  json += ",\"th\":"  + String(robot_theta_deg, 1);
+  json += ",\"valid\":" + String(robot_pose_valid ? 1 : 0);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // WiFi AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Web routes
+  server.on("/",          handleRoot);
+  server.on("/cmd",       handleCmd);
+  server.on("/data",      handleData);
+  server.on("/goto",      handleGoto);
+  server.on("/stop",      handleStop);
+  server.on("/waypoints", handleWaypoints);
+  server.on("/clearwp",   handleClearWP);
+  server.begin();
+
+  // I2C
+  Wire.begin(SDA_PIN, SCL_PIN, 40000);
+
+  // Encoders
+  pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
+
+  // Motor PWM (ESP32 Core 3.x)
+  ledcAttach(M1_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_LPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_LPWM_PIN, PWM_FREQ, PWM_RES);
+
+  // Servo PWM
+  pinMode(SERVO_PIN, OUTPUT);
+  bool okServo = ledcAttach(SERVO_PIN, SERVO_FREQ_HZ, SERVO_RES_BITS);
+  Serial.printf("Servo ledcAttach = %d\n", okServo);
+
+  // Vive
+  vive.begin();
+
+  Serial.println("------------------------------------");
+  Serial.println("INTEGRATED: Buttons + Vive(GOTO/WP) + TopHat(2Hz) + ServoSweep");
+  Serial.printf("Vive Pin: %d\n", SIGNALPIN);
+  Serial.printf("Filter: window=%d, thr=%.1f\n", WINDOW_SIZE, OUTLIER_THRESHOLD);
+  Serial.printf("I2C SDA=%d SCL=%d addr=0x%02X\n", SDA_PIN, SCL_PIN, I2C_SLAVE_ADDR);
+  Serial.println("------------------------------------");
+}
+
+// ===================== Loop =====================
+void loop() {
+  server.handleClient();
+
+  // Servo 攻击臂（持续扫动）
+  servoSweepTask();
+
+  unsigned long now = millis();
+  static unsigned long last_motor_time = 0;
+  static unsigned long last_vive_time  = 0;
+
+  // ------- Vive 更新与位姿估计 -------
+  if (now - last_vive_time >= 50) {
+    updateVive();
+
+    if (vive_valid) {
+      robot_rx = vive_x;
+      robot_ry = vive_y;
+
+      if (!heading_initialized) {
+        last_rx = robot_rx;
+        last_ry = robot_ry;
+        heading_initialized = true;
+      } else {
+        float dx = robot_rx - last_rx;
+        float dy = robot_ry - last_ry;
+        float dist_move = sqrtf(dx*dx + dy*dy);
+        if (dist_move > 3.0f) {
+          float new_heading = atan2f(dy, dx);
+          headingRad = 0.6f * headingRad + 0.4f * new_heading;
+          last_rx = robot_rx;
+          last_ry = robot_ry;
+        }
+      }
+
+      robot_theta_deg = headingRad * 180.0f / PI;
+      robot_pose_valid = true;
+    } else {
+      robot_pose_valid = false;
+    }
+
+    // 保留你原来的打印风格（不删）
+    if (vive_valid) {
+      Serial.print("Vive(FILT): (");
+      Serial.print(vive_x);
+      Serial.print(", ");
+      Serial.print(vive_y);
+      Serial.print(") | Pose: X=");
+      Serial.print(robot_rx, 1);
+      Serial.print(", Y=");
+      Serial.print(robot_ry, 1);
+      Serial.print(", Th=");
+      Serial.print(robot_theta_deg, 1);
+      Serial.println(" deg");
+    } else {
+      Serial.println("Vive: Invalid/Lost Tracking.");
+    }
+
+    last_vive_time = now;
+  }
+
+  // ------- GOTO / WAYPOINTS 控制（DEAD 时不运行） -------
+  if (run_flag == 1 && goto_active && robot_pose_valid) {
+    float dx = target_x - robot_rx;
+    float dy = target_y - robot_ry;
+    float dist = sqrtf(dx*dx + dy*dy);
+
+    if (dist < GOTO_DIST_EPS) {
+      if (wp_active) {
+        Serial.println("WAYPOINTS: Reached one -> advance.");
+        advanceWaypoint();
+      } else {
+        hardStopNow();
+        Serial.println("GOTO: Target reached -> STOP.");
+      }
+    } else {
+      float desired_heading = atan2f(dy, dx);
+      float err = desired_heading - headingRad;
+      while (err >  PI) err -= 2.0f * PI;
+      while (err < -PI) err += 2.0f * PI;
+
+      float v;
+      if (dist > GOTO_SLOW_DIST) v = MAX_SPEED_RPM;
+      else {
+        float ratio = dist / GOTO_SLOW_DIST;
+        v = MIN_GOTO_SPEED + (MAX_SPEED_RPM - MIN_GOTO_SPEED) * ratio;
+      }
+
+      float omega = KW * err * (MAX_SPEED_RPM / PI);
+      float maxOmega = 0.7f * MAX_SPEED_RPM;
+      if (omega >  maxOmega) omega =  maxOmega;
+      if (omega < -maxOmega) omega = -maxOmega;
+
+      float left_rpm  = v - omega;
+      float right_rpm = v + omega;
+
+      left_rpm  = constrain(left_rpm,  -MAX_SPEED_RPM, MAX_SPEED_RPM);
+      right_rpm = constrain(right_rpm, -MAX_SPEED_RPM, MAX_SPEED_RPM);
+
+      target_rpm_m1 = left_rpm;
+      target_rpm_m2 = right_rpm;
+    }
+  }
+
+  // ------- 电机 PID 更新 -------
+  if (now - last_motor_time >= (unsigned long)SAMPLE_TIME_MS) {
+    float dt = (now - last_motor_time) / 1000.0f;
+
+    noInterrupts();
+    long p1 = M1_duration; M1_duration = 0;
+    long p2 = M2_duration; M2_duration = 0;
+    interrupts();
+
+    current_rpm1 = (p1 / COUNTS_PER_REV) * 60.0f / dt;
+    current_rpm2 = (p2 / COUNTS_PER_REV) * 60.0f / dt;
+
+    if (run_flag == 0) {
+      pwm1 = 0; pwm2 = 0;
+      pid1.reset(); pid2.reset();
+    } else {
+      pwm1 = (abs(target_rpm_m1) > 0.1f) ? pid1.compute(target_rpm_m1, current_rpm1, dt) : 0;
+      pwm2 = (abs(target_rpm_m2) > 0.1f) ? pid2.compute(target_rpm_m2, current_rpm2, dt) : 0;
+    }
+
+    set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, pwm1);
+    set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, pwm2);
+
+    last_motor_time = now;
+  }
+
+  // ------- TopHat 2Hz I2C：只上报“用户操作次数” -------
+  if (now - previousMillis >= COMM_INTERVAL_MS) {
+    previousMillis = now;
+
+    uint32_t pk = wifi_packets_window;
+    wifi_packets_window = 0;
+    uint8_t pk_byte = (pk > 255) ? 255 : (uint8_t)pk;
+
+    Serial.printf("WiFi TX(window): %lu -> send: 0x%02X (%u)\n", pk, pk_byte, pk_byte);
+
+    send_I2C_byte(pk_byte);
+    receive_I2C_byte();
+
+    Serial.printf("-> RUN_FLAG: %d\n", run_flag);
+    Serial.println("----------------------------------------");
+  }
+}
