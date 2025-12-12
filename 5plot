@@ -1,0 +1,769 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "vive510.h"
+#include <math.h>     // atan2, PI, copysign
+
+// ===================== 用户配置区 =====================
+#define INVERT_M1_ENCODER false
+#define INVERT_M2_ENCODER true   // 右轮反接修正
+
+const char *ssid      = "ESP32_Joystick_Car";
+const char *password = "12345678";
+
+// ===================== PID 参数 =====================
+float Kp1 = 3.0,  Ki1 = 0.0, Kd1 = 0.1;
+float Kp2 = 2.93, Ki2 = 0.0, Kd2 = 0.1;
+
+// 最大速度限制 (RPM)
+const float MAX_SPEED_RPM = 80.0;
+
+// ===================== 编码器 / 时间参数 =====================
+const float COUNTS_PER_REV = 4480.0;
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+const int SAMPLE_TIME_MS = 100;
+
+volatile float target_rpm_m1 = 0.0;
+volatile float target_rpm_m2 = 0.0;
+
+float current_rpm1 = 0;
+float current_rpm2 = 0;
+int pwm1 = 0;
+int pwm2 = 0;
+
+// ===================== 简单 PID 类 =====================
+class SimplePID {
+  public:
+    float kp, ki, kd;
+    float integral = 0;
+    float prev_error = 0;
+
+    SimplePID(float p, float i, float d) : kp(p), ki(i), kd(d) {}
+
+    int compute(float target, float current, float dt) {
+      float error = target - current;
+      integral += error * dt;
+      integral = constrain(integral, -255.0, 255.0);
+      float derivative = (error - prev_error) / dt;
+      prev_error = error;
+      float output = (kp * error) + (ki * integral) + (kd * derivative);
+      return (int)constrain(output, -255, 255);
+    }
+
+    void reset() {
+      integral = 0;
+      prev_error = 0;
+    }
+};
+
+SimplePID pid1(Kp1, Ki1, Kd1);
+SimplePID pid2(Kp2, Ki2, Kd2);
+
+// ===================== 电机与编码器定义 =====================
+const int M1_ENCODER_A_PIN = 7;
+const int M1_ENCODER_B_PIN = 3;
+const int M1_RPWM_PIN      = 33;
+const int M1_LPWM_PIN      = 38;
+volatile long M1_duration  = 0;
+volatile int  M1_encoder0PinALast = LOW;
+
+const int M2_ENCODER_A_PIN = 18;
+const int M2_ENCODER_B_PIN = 14;
+const int M2_RPWM_PIN      = 6;
+const int M2_LPWM_PIN      = 5;
+volatile long M2_duration  = 0;
+volatile int  M2_encoder0PinALast = LOW;
+
+WebServer server(80);
+
+// ===================== Vive 定义（单 Vive + 滤波） =====================
+#define SIGNALPIN 12   // Vive 信号引脚
+
+Vive510 vive(SIGNALPIN);
+
+uint16_t vive_x = 0, vive_y = 0;
+bool vive_valid = false;
+
+// ---- 中值滤波 + 异常值剔除 ----
+const int   WINDOW_SIZE = 5;
+const float OUTLIER_THRESHOLD = 500.0f; // 超过这么多算跳点，丢弃
+
+class MedianFilter {
+  public:
+    uint16_t history[WINDOW_SIZE];
+    int head = 0;
+    int count = 0;
+
+    MedianFilter() {
+      for (int i=0;i<WINDOW_SIZE;i++) history[i] = 0;
+    }
+
+    void add(uint16_t v) {
+      history[head] = v;
+      head = (head + 1) % WINDOW_SIZE;
+      if (count < WINDOW_SIZE) count++;
+    }
+
+    uint16_t median() {
+      if (count == 0) return 0;
+      uint16_t tmp[WINDOW_SIZE];
+      for (int i=0;i<count;i++) tmp[i] = history[i];
+      for (int i=0;i<count-1;i++) {
+        for (int j=i+1;j<count;j++) {
+          if (tmp[j] < tmp[i]) {
+            uint16_t t = tmp[i]; tmp[i]=tmp[j]; tmp[j]=t;
+          }
+        }
+      }
+      return tmp[count/2];
+    }
+};
+
+MedianFilter filterX;
+MedianFilter filterY;
+
+bool filterViveValue(uint16_t val, MedianFilter &f) {
+  if (f.count < 3) {
+    f.add(val);
+    return true;
+  }
+  uint16_t med = f.median();
+  if (abs((long)val - (long)med) > OUTLIER_THRESHOLD) {
+    return false;
+  }
+  f.add(val);
+  return true;
+}
+
+// 机器人位姿估计
+float robot_rx = 0.0f, robot_ry = 0.0f;
+float robot_theta_deg = 0.0f;
+bool  robot_pose_valid = false;
+
+float headingRad = 0.0f;
+bool heading_initialized = false;
+float last_rx = 0.0f, last_ry = 0.0f;
+
+// ===================== Go-To 目标点控制 / 路径点配置 =====================
+#define MAX_WAYPOINTS 5
+struct Waypoint {
+  float x;
+  float y;
+};
+// 路径点数组，初始值设为 0
+Waypoint waypoints[MAX_WAYPOINTS] = {
+  {0.0f, 0.0f},
+  {0.0f, 0.0f},
+  {0.0f, 0.0f},
+  {0.0f, 0.0f},
+  {0.0f, 0.0f}
+};
+volatile int current_waypoint_index = 0;
+const int total_waypoints = MAX_WAYPOINTS;
+
+bool goto_active = false;
+
+// 调大停止阈值，让它真的会停下来
+const float GOTO_DIST_EPS   = 50.0f;  // 距离小于 50 就算到达当前路径点
+const float GOTO_SLOW_DIST  = 400.0f;
+const float MIN_GOTO_SPEED  = 25.0f;
+const float KW              = 2.0f;
+
+// ===================== 网页代码 =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+  <meta charset="utf-8">
+  <title>ESP32 Joystick</title>
+  <style>
+    body { font-family: 'Microsoft YaHei', Arial, sans-serif; text-align: center; margin:0; padding:0; background: #ffffff; color: #333; overflow: hidden; touch-action: none;}
+    h2 { margin: 15px 0; font-size: 1.4rem; color: #444; }
+
+    #joystick-container {
+      position: relative;
+      width: 200px;
+      height: 200px;
+      margin: 10px auto;
+      background: #f0f0f0;
+      border-radius: 50%;
+      border: 2px solid #ccc;
+      box-shadow: inset 0 0 10px rgba(0,0,0,0.1);
+    }
+
+    #joystick-knob {
+      position: absolute;
+      width: 60px;
+      height: 60px;
+      background: #007bff;
+      border-radius: 50%;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+      cursor: pointer;
+    }
+
+    .data-box { display: flex; justify-content: space-around; margin-top: 10px; font-size: 0.9rem; flex-wrap: wrap; }
+    .val { font-weight: bold; font-family: monospace; font-size: 1.0rem; }
+    .lbl-l { color: #d32f2f; }
+    .lbl-r { color: #1976d2; }
+
+    .goto-box {
+      margin-top: 10px;
+      font-size: 0.9rem;
+    }
+    .goto-box input {
+      width: 60px; /* 调整输入框宽度以适应 5 组 */
+      padding: 4px;
+      margin: 2px;
+      text-align: center;
+    }
+    .goto-box label {
+        display: inline-block;
+        width: 15px;
+        text-align: right;
+    }
+    .goto-box button {
+      padding: 8px 15px;
+      margin: 5px 2px;
+      border: none;
+      border-radius: 4px;
+      background: #007bff;
+      color: white;
+      font-size: 0.9rem;
+      font-weight: bold;
+    }
+    .goto-box button.stop {
+        background: #d32f2f;
+    }
+    #waypoints-input { margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h2>🕹️ 虚拟摇杆控制 + Vive 导航</h2>
+
+  <div id="joystick-container">
+    <div id="joystick-knob"></div>
+  </div>
+
+  <div class="data-box">
+    <div class="lbl-l">左轮 RPM: <span id="rpm1" class="val">0</span></div>
+    <div class="lbl-r">右轮 RPM: <span id="rpm2" class="val">0</span></div>
+  </div>
+
+  <div class="data-box">
+    <div>Vive: (<span id="v1x" class="val">0</span>, <span id="v1y" class="val">0</span>)</div>
+  </div>
+
+  <div class="data-box">
+    <div>Pose: X=<span id="rx" class="val">0</span>,
+          Y=<span id="ry" class="val">0</span>,
+          θ=<span id="th" class="val">0</span>°</div>
+  </div>
+  
+  <div class="data-box" style="margin-top: 5px; font-size: 1.0rem;">
+    <div>**当前目标点:** <span id="target_idx" class="val">STOP</span> / (<span id="target_x" class="val">0</span>, <span id="target_y" class="val">0</span>)</div>
+  </div>
+
+  <div class="goto-box" style="margin-top: 15px; border-top: 1px solid #eee; padding-top: 10px;">
+    <h4>🗺️ 路径点设置 (X, Y in mm)</h4>
+    <div id="waypoints-input">
+        <label>1: </label><input id="wx1" type="number" placeholder="X" value="1000"><input id="wy1" type="number" placeholder="Y" value="3000"><br>
+        <label>2: </label><input id="wx2" type="number" placeholder="X" value="3000"><input id="wy2" type="number" placeholder="Y" value="3000"><br>
+        <label>3: </label><input id="wx3" type="number" placeholder="X" value="3000"><input id="wy3" type="number" placeholder="Y" value="1000"><br>
+        <label>4: </label><input id="wx4" type="number" placeholder="X" value="1000"><input id="wy4" type="number" placeholder="Y" value="1000"><br>
+        <label>5: </label><input id="wx5" type="number" placeholder="X" value="1000"><input id="wy5" type="number" placeholder="Y" value="3000">
+    </div>
+    <button onclick="sendWaypoints()">💾 保存路径点</button>
+    <button onclick="startMission()">🚀 启动任务</button>
+    <button class="stop" onclick="sendStop()">🛑 STOP</button>
+  </div>
+
+  <p style="color:#888; font-size:0.8rem; margin-top: 8px;">
+    摇杆：手动控制。启动任务：按顺序导航到 5 个已保存的路径点。
+  </p>
+
+<script>
+  var container = document.getElementById("joystick-container");
+  var knob      = document.getElementById("joystick-knob");
+
+  var maxRadius = 70;
+
+  var rect = container.getBoundingClientRect();
+  var centerX = rect.width / 2;
+  var centerY = rect.height / 2;
+  var isDragging = false;
+  var lastSendTime = 0;
+
+  knob.addEventListener("mousedown", startDrag);
+  knob.addEventListener("touchstart", startDrag);
+  document.addEventListener("mousemove", moveDrag);
+  document.addEventListener("touchmove", moveDrag);
+  document.addEventListener("mouseup", endDrag);
+  document.addEventListener("touchend", endDrag);
+
+  function startDrag(e) {
+    isDragging = true;
+    e.preventDefault();
+  }
+
+  function moveDrag(e) {
+    if (!isDragging) return;
+    e.preventDefault();
+
+    var clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    var clientY = e.touches ? e.touches[0].clientY : e.clientY;
+
+    rect = container.getBoundingClientRect();
+    var x = clientX - rect.left - centerX;
+    var y = clientY - rect.top  - centerY;
+
+    var distance = Math.sqrt(x*x + y*y);
+    if (distance > maxRadius) {
+      var angle = Math.atan2(y, x);
+      x = Math.cos(angle) * maxRadius;
+      y = Math.sin(angle) * maxRadius;
+    }
+
+    knob.style.transform = `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`;
+
+    var now = Date.now();
+    if (now - lastSendTime > 100) {
+      var normX = Math.round((x / maxRadius) * 100);
+      var normY = Math.round((y / maxRadius) * -100);
+      sendJoystick(normX, normY);
+      lastSendTime = now;
+    }
+  }
+
+  function endDrag() {
+    isDragging = false;
+    knob.style.transform = "translate(-50%, -50%)";
+    sendJoystick(0, 0);
+  }
+
+  function sendJoystick(x, y) {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/joystick?x=" + x + "&y=" + y, true);
+    xhr.send();
+  }
+
+  function sendWaypoints() {
+    var params = "";
+    for(let i = 1; i <= 5; i++) {
+        var wx = document.getElementById("wx" + i).value;
+        var wy = document.getElementById("wy" + i).value;
+        if (wx === "" || wy === "") {
+            alert("请确保所有 5 个路径点的 X 和 Y 坐标都已输入。");
+            return;
+        }
+        params += `&wx${i}=${wx}&wy${i}=${wy}`;
+    }
+    
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/set_waypoints?" + params.substring(1), true); 
+    xhr.onreadystatechange = function() {
+        if (this.readyState == 4 && this.status == 200) {
+            alert("路径点已成功保存！");
+        } else if (this.readyState == 4) {
+             alert("保存路径点失败，状态码: " + this.status);
+        }
+    };
+    xhr.send();
+  }
+
+  function startMission() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/start_mission", true); 
+    xhr.onreadystatechange = function() {
+        if (this.readyState == 4 && this.status == 200) {
+            console.log("Mission started.");
+        } else if (this.readyState == 4) {
+             alert("启动任务失败，状态码: " + this.status + " (请检查Vive是否定位成功)");
+        }
+    };
+    xhr.send();
+  }
+
+  function sendStop() {
+    var xhr = new XMLHttpRequest();
+    xhr.open("GET", "/stop", true);
+    xhr.send();
+  }
+
+  setInterval(function() {
+    var xhr = new XMLHttpRequest();
+    xhr.onreadystatechange = function() {
+      if (this.readyState == 4 && this.status == 200) {
+        var json = JSON.parse(this.responseText);
+        document.getElementById("rpm1").innerHTML = json.m1.toFixed(1);
+        document.getElementById("rpm2").innerHTML = json.m2.toFixed(1);
+
+        document.getElementById("v1x").innerHTML = json.v1x;
+        document.getElementById("v1y").innerHTML = json.v1y;
+
+        document.getElementById("rx").innerHTML  = json.rx.toFixed(1);
+        document.getElementById("ry").innerHTML  = json.ry.toFixed(1);
+        document.getElementById("th").innerHTML  = json.th.toFixed(1);
+        
+        // 更新目标点显示
+        if (json.goto_active == 1) {
+            document.getElementById("target_idx").innerHTML = `WPT ${json.current_wp_idx}/${json.total_wp}`;
+            document.getElementById("target_x").innerHTML = json.target_x.toFixed(1);
+            document.getElementById("target_y").innerHTML = json.target_y.toFixed(1);
+        } else {
+            document.getElementById("target_idx").innerHTML = "STOP";
+            document.getElementById("target_x").innerHTML = "0";
+            document.getElementById("target_y").innerHTML = "0";
+        }
+      }
+    };
+    xhr.open("GET", "/data", true);
+    xhr.send();
+  }, 200);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ===================== 编码器中断 =====================
+void IRAM_ATTR wheelSpeed_M1() {
+  int Lstate = digitalRead(M1_ENCODER_A_PIN);
+  if (Lstate != M1_encoder0PinALast) {
+    int val = digitalRead(M1_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M1_ENCODER) dir = !dir;
+    if (dir) M1_duration++; else M1_duration--;
+  }
+  M1_encoder0PinALast = Lstate;
+}
+
+void IRAM_ATTR wheelSpeed_M2() {
+  int Lstate = digitalRead(M2_ENCODER_A_PIN);
+  if (Lstate != M2_encoder0PinALast) {
+    int val = digitalRead(M2_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M2_ENCODER) dir = !dir;
+    if (dir) M2_duration++; else M2_duration--;
+  }
+  M2_encoder0PinALast = Lstate;
+}
+
+// ===================== 电机驱动 =====================
+void set_motor_pwm(int rpwm_pin, int lpwm_pin, int pwm_val) {
+  if (pwm_val > 0) {
+    ledcWrite(lpwm_pin, 0);
+    ledcWrite(rpwm_pin, pwm_val);
+  } else {
+    ledcWrite(lpwm_pin, abs(pwm_val));
+    ledcWrite(rpwm_pin, 0);
+  }
+}
+
+// ===================== Vive 更新（带滤波） =====================
+void updateVive() {
+  if (vive.status() == VIVE_RECEIVING) {
+    uint16_t x_raw = vive.xCoord();
+    uint16_t y_raw = vive.yCoord();
+
+    bool range_ok = (x_raw > 1000 && x_raw < 8000 &&
+                     y_raw > 1000 && y_raw < 8000);
+
+    if (range_ok) {
+      bool okx = filterViveValue(x_raw, filterX);
+      bool oky = filterViveValue(y_raw, filterY);
+
+      if (okx && oky) {
+        vive_x = filterX.median();
+        vive_y = filterY.median();
+        vive_valid = true;
+      }
+    } else {
+      vive_valid = false;
+    }
+  } else {
+    vive_valid = false;
+    vive.sync(5);
+  }
+}
+
+// ===================== Web Handlers =====================
+void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", index_html);
+}
+
+void handleJoystick() {
+  if (server.hasArg("x") && server.hasArg("y")) {
+    int x = server.arg("x").toInt();
+    int y = server.arg("y").toInt();
+
+    // 一旦用摇杆，退出 goto 模式并重置路径点索引
+    goto_active = false;
+    current_waypoint_index = 0; 
+
+    float left  = (float)y + (float)x;
+    float right = (float)y - (float)x;
+
+    float maxVal = max(abs(left), abs(right));
+    if (maxVal > 100) {
+      left  = (left  / maxVal) * 100.0f;
+      right = (right / maxVal) * 100.0f;
+    }
+
+    target_rpm_m1 = (left  / 100.0f) * MAX_SPEED_RPM;
+    target_rpm_m2 = (right / 100.0f) * MAX_SPEED_RPM;
+
+    if (x == 0 && y == 0) {
+      pid1.reset();
+      pid2.reset();
+    }
+
+    server.send(200, "text/plain", "OK");
+  }
+}
+
+void handleSetWaypoints() {
+  // 检查是否所有 10 个参数都存在 (wx1, wy1 ... wx5, wy5)
+  if (server.args() != 10) {
+    server.send(400, "text/plain", "Missing 10 waypoint parameters (5x, 5y)");
+    return;
+  }
+
+  for (int i = 0; i < total_waypoints; i++) {
+    String x_key = "wx" + String(i + 1);
+    String y_key = "wy" + String(i + 1);
+
+    // 假设参数名都正确，直接取值
+    waypoints[i].x = server.arg(x_key).toFloat();
+    waypoints[i].y = server.arg(y_key).toFloat();
+    Serial.printf("WPT %d set: (%.1f, %.1f)\n", i + 1, waypoints[i].x, waypoints[i].y);
+  }
+
+  server.send(200, "text/plain", "Waypoints saved.");
+}
+
+void handleStartMission() {
+  if (robot_pose_valid) {
+    current_waypoint_index = 0;
+    goto_active = true;
+    Serial.print("GOTO: Starting mission with ");
+    Serial.print(total_waypoints);
+    Serial.println(" saved waypoints.");
+    server.send(200, "text/plain", "MISSION START");
+  } else {
+    server.send(400, "text/plain", "Pose Invalid: Cannot start mission without valid pose.");
+  }
+}
+
+void handleStop() {
+  goto_active = false;
+  current_waypoint_index = 0; // 重置路径点索引
+  target_rpm_m1 = 0.0f;
+  target_rpm_m2 = 0.0f;
+  pid1.reset();
+  pid2.reset();
+  // 直接把 PWM 清零，立即停
+  set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, 0);
+  set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, 0);
+  Serial.println("STOP by user. Waypoint index reset.");
+  server.send(200, "text/plain", "STOP");
+}
+
+void handleData() {
+  // 报告当前目标点和导航状态
+  float current_target_x = 0.0f;
+  float current_target_y = 0.0f;
+  int wp_idx_display = 0;
+
+  if (goto_active && current_waypoint_index < total_waypoints) {
+    current_target_x = waypoints[current_waypoint_index].x;
+    current_target_y = waypoints[current_waypoint_index].y;
+    wp_idx_display = current_waypoint_index + 1; // 从 1 开始显示
+  }
+
+  String json = "{";
+  json += "\"m1\":"  + String(current_rpm1);
+  json += ",\"m2\":" + String(current_rpm2);
+  json += ",\"v1x\":" + String(vive_x);
+  json += ",\"v1y\":" + String(vive_y);
+  json += ",\"rx\":"  + String(robot_rx, 1);
+  json += ",\"ry\":"  + String(robot_ry, 1);
+  json += ",\"th\":"  + String(robot_theta_deg, 1);
+  json += ",\"valid\":" + String(robot_pose_valid ? 1 : 0);
+  json += ",\"goto_active\":" + String(goto_active ? 1 : 0);
+  json += ",\"current_wp_idx\":" + String(wp_idx_display);
+  json += ",\"total_wp\":" + String(total_waypoints);
+  json += ",\"target_x\":" + String(current_target_x, 1);
+  json += ",\"target_y\":" + String(current_target_y, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  WiFi.softAP(ssid, password);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  server.on("/",       handleRoot);
+  server.on("/joystick", handleJoystick);
+  server.on("/data",     handleData);
+  server.on("/set_waypoints", handleSetWaypoints); // 新增的路径点设置路由
+  server.on("/start_mission", handleStartMission); // 新增的启动任务路由
+  server.on("/stop",     handleStop);
+  server.begin();
+
+  pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
+
+  ledcAttach(M1_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_LPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_LPWM_PIN, PWM_FREQ, PWM_RES);
+
+  vive.begin();
+
+  Serial.println("------------------------------------");
+  Serial.println("Multi-Waypoint Navigation (Manual Input, Forward Only) Init Done.");
+  Serial.printf("Total Waypoints: %d\n", total_waypoints);
+  Serial.println("------------------------------------");
+}
+
+// ===================== Loop =====================
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  static unsigned long last_motor_time = 0;
+  static unsigned long last_vive_time  = 0;
+
+  // ------- Vive 更新与位姿估计 (不变) -------
+  if (now - last_vive_time >= 50) {
+    updateVive();
+
+    if (vive_valid) {
+      robot_rx = vive_x;
+      robot_ry = vive_y;
+
+      if (!heading_initialized) {
+        last_rx = robot_rx;
+        last_ry = robot_ry;
+        heading_initialized = true;
+      } else {
+        float dx = robot_rx - last_rx;
+        float dy = robot_ry - last_ry;
+        float dist_move = sqrtf(dx*dx + dy*dy);
+        if (dist_move > 3.0f) {
+          float new_heading = atan2f(dy, dx);
+          headingRad = 0.6f * headingRad + 0.4f * new_heading;
+          last_rx = robot_rx;
+          last_ry = robot_ry;
+        }
+      }
+
+      robot_theta_deg = headingRad * 180.0f / PI;
+      robot_pose_valid = true;
+    } else {
+      robot_pose_valid = false;
+    }
+
+    last_vive_time = now;
+  }
+
+  // ------- GOTO 路径点控制 (前进模式) -------
+  if (goto_active && robot_pose_valid) {
+    if (current_waypoint_index >= total_waypoints) {
+      // 任务完成
+      goto_active = false;
+      target_rpm_m1 = 0.0f;
+      target_rpm_m2 = 0.0f;
+      pid1.reset();
+      pid2.reset();
+      set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, 0);
+      set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, 0);
+      Serial.println("GOTO: Mission Complete -> STOP.");
+    } else {
+      // 获取当前目标点
+      float target_x = waypoints[current_waypoint_index].x;
+      float target_y = waypoints[current_waypoint_index].y;
+
+      float dx = target_x - robot_rx;
+      float dy = target_y - robot_ry;
+      float dist = sqrtf(dx*dx + dy*dy);
+
+      if (dist < GOTO_DIST_EPS) {
+        // 到达当前路径点，切换到下一个
+        Serial.printf("GOTO: Waypoint %d reached (%.1f, %.1f). Switching...\n", 
+                       current_waypoint_index + 1, target_x, target_y);
+        current_waypoint_index++;
+        return; // 跳过本次 PID/PWM 更新，处理下一个目标点
+      }
+
+      // 计算导航命令 (前进模式)
+      float desired_heading = atan2f(dy, dx);
+      float err = desired_heading - headingRad;
+      while (err >  PI) err -= 2.0f * PI;
+      while (err < -PI) err += 2.0f * PI;
+
+      float v;
+      if (dist > GOTO_SLOW_DIST) {
+        v = MAX_SPEED_RPM;
+      } else {
+        float ratio = dist / GOTO_SLOW_DIST;
+        v = MIN_GOTO_SPEED + (MAX_SPEED_RPM - MIN_GOTO_SPEED) * ratio;
+      }
+      
+      // 角速度控制 (只前进)
+      float omega = KW * err * (MAX_SPEED_RPM / PI);
+      float maxOmega = 0.7f * MAX_SPEED_RPM;
+      if (omega >  maxOmega) omega =  maxOmega;
+      if (omega < -maxOmega) omega = -maxOmega;
+
+      float left_rpm  = v - omega;
+      float right_rpm = v + omega;
+
+      left_rpm  = constrain(left_rpm,  -MAX_SPEED_RPM, MAX_SPEED_RPM);
+      right_rpm = constrain(right_rpm, -MAX_SPEED_RPM, MAX_SPEED_RPM);
+
+      target_rpm_m1 = left_rpm;
+      target_rpm_m2 = right_rpm;
+      
+      Serial.printf("GOTO WPT %d: Dist: %.1f, Err: %.1f deg, RPM: (%.1f, %.1f)\n", 
+                     current_waypoint_index + 1, dist, err * 180.0f / PI, target_rpm_m1, target_rpm_m2);
+    }
+  }
+
+  // ------- 电机 PID 更新 (不变) -------
+  if (now - last_motor_time >= (unsigned long)SAMPLE_TIME_MS) {
+    float dt = (now - last_motor_time) / 1000.0f;
+
+    noInterrupts();
+    long p1 = M1_duration; M1_duration = 0;
+    long p2 = M2_duration; M2_duration = 0;
+    interrupts();
+
+    current_rpm1 = (p1 / COUNTS_PER_REV) * 60.0f / dt;
+    current_rpm2 = (p2 / COUNTS_PER_REV) * 60.0f / dt;
+
+    if (abs(target_rpm_m1) > 0.1f) pwm1 = pid1.compute(target_rpm_m1, current_rpm1, dt);
+    else { pwm1 = 0; pid1.reset(); } 
+    
+    if (abs(target_rpm_m2) > 0.1f) pwm2 = pid2.compute(target_rpm_m2, current_rpm2, dt);
+    else { pwm2 = 0; pid2.reset(); }
+
+    set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, pwm1);
+    set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, pwm2);
+
+    last_motor_time = now;
+  }
+}
