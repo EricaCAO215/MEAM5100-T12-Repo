@@ -12,91 +12,23 @@ WebServer server(80);
 #define I2C_SLAVE_ADDR      0x28
 #define SDA_PIN             43
 #define SCL_PIN             44
-#define COMM_INTERVAL_MS    500
+#define COMM_INTERVAL_MS    500   // 2 Hz
 
-// ===================== Counters =====================
-// 用“HTTP请求数”近似 WiFi 发送包数量（window内）
-volatile uint32_t wifi_tx_count_window = 0;   // 每500ms清零一次
-volatile uint32_t wifi_tx_count_total  = 0;
-
-// ===================== Run Flag / HP =====================
+// ===================== HP / RUN FLAG =====================
 volatile int run_flag = 1;
 unsigned long previousMillis = 0;
 
-// ===================== Motor Stub =====================
+// ===================== “发包”统计：只统计用户操作 =====================
+// 只有用户按按钮/触发cmd才算“扣血包”
+volatile uint32_t wifi_packets_window = 0;
+
+// ===================== Motor Stub（你需要自己换成真实电机控制） =====================
 void stop_all_motors() {
-  // TODO: 你在这里放真实停电机代码
   Serial.println("ROBOT MOVEMENT DISABLED.");
+  // TODO: 在这里写真实停电机（PWM=0 / 刹车等）
 }
 
-// ===================== Web UI =====================
-const char index_html[] PROGMEM = R"rawliteral(
-<!doctype html><html>
-<head>
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
-<meta charset="utf-8">
-<title>ESP32 Control</title>
-<style>
-  body{font-family:Arial;text-align:center;margin:0;padding:12px}
-  h2{margin:8px 0}
-  .grid{display:grid;grid-template-columns:repeat(3,90px);grid-gap:10px;justify-content:center;margin-top:18px}
-  button{height:54px;font-size:16px;border:none;border-radius:10px;background:#007bff;color:white}
-  button.gray{background:#444}
-  .info{margin-top:16px;font-family:monospace}
-</style>
-</head>
-<body>
-<h2>Robot Buttons</h2>
-
-<div class="grid">
-  <div></div>
-  <button onclick="send('F')">Forward</button>
-  <div></div>
-
-  <button onclick="send('L')">Left</button>
-  <button class="gray" onclick="send('S')">Stop</button>
-  <button onclick="send('R')">Right</button>
-
-  <div></div>
-  <button onclick="send('B')">Backward</button>
-  <div></div>
-</div>
-
-<div class="info">
-  <div>Last cmd: <span id="c">-</span></div>
-  <div>Ping: <span id="p">-</span></div>
-</div>
-
-<script>
-function send(c){
-  document.getElementById("c").innerText=c;
-  var xhr=new XMLHttpRequest();
-  xhr.open("GET","/cmd?c="+c,true);
-  xhr.send();
-}
-
-// 轮询一下，确保有持续HTTP traffic（可删）
-setInterval(function(){
-  var xhr=new XMLHttpRequest();
-  xhr.onreadystatechange=function(){
-    if(this.readyState==4 && this.status==200){
-      document.getElementById("p").innerText=Date.now();
-    }
-  };
-  xhr.open("GET","/ping",true);
-  xhr.send();
-}, 500);
-</script>
-</body></html>
-)rawliteral";
-
-// ===================== Helpers =====================
-static inline void count_wifi_tx() {
-  wifi_tx_count_total++;
-  wifi_tx_count_window++;
-}
-
-// ===================== I2C =====================
+// ===================== I2C Master (保持你第一份串口风格) =====================
 void send_I2C_byte(uint8_t data) {
   Wire.beginTransmission(I2C_SLAVE_ADDR);
   Wire.write(data);
@@ -134,35 +66,100 @@ uint8_t receive_I2C_byte() {
   return current_health_hp;
 }
 
+// ===================== 用户操作计数（只有这里会扣血） =====================
+static inline void count_user_action_packet() {
+  wifi_packets_window++;
+}
+
+// ===================== Web UI (按钮页面) =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!doctype html><html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta charset="utf-8">
+<title>ESP32 Control</title>
+<style>
+  body{font-family:Arial;text-align:center;margin:0;padding:12px}
+  h2{margin:8px 0}
+  .grid{display:grid;grid-template-columns:repeat(3,90px);grid-gap:10px;justify-content:center;margin-top:18px}
+  button{height:54px;font-size:16px;border:none;border-radius:10px;background:#007bff;color:white}
+  button.gray{background:#444}
+  .info{margin-top:16px;font-family:monospace}
+</style>
+</head>
+<body>
+<h2>Robot Buttons</h2>
+
+<div class="grid">
+  <div></div>
+  <button onclick="send('F')">Forward</button>
+  <div></div>
+
+  <button onclick="send('L')">Left</button>
+  <button class="gray" onclick="send('S')">Stop</button>
+  <button onclick="send('R')">Right</button>
+
+  <div></div>
+  <button onclick="send('B')">Backward</button>
+  <div></div>
+</div>
+
+<div class="info">
+  <div>Last cmd: <span id="c">-</span></div>
+  <div>Status: <span id="st">-</span></div>
+</div>
+
+<script>
+function send(c){
+  document.getElementById("c").innerText=c;
+  var xhr=new XMLHttpRequest();
+  xhr.onreadystatechange=function(){
+    if(this.readyState==4){
+      document.getElementById("st").innerText=this.status + " " + this.responseText;
+    }
+  };
+  xhr.open("GET","/cmd?c="+c,true);
+  xhr.send();
+}
+</script>
+</body></html>
+)rawliteral";
+
 // ===================== Web Handlers =====================
+// 注意：/ 和 /status 不计数！只在 /cmd 计数！
+
 void handleRoot() {
-  count_wifi_tx();
   server.send(200, "text/html; charset=utf-8", index_html);
 }
 
-void handlePing() {
-  count_wifi_tx();
-  server.send(200, "text/plain", "OK");
+void handleStatus() {
+  // 不扣血，只给你看状态
+  String s = "RUN_FLAG=" + String(run_flag);
+  server.send(200, "text/plain", s);
 }
 
 void handleCmd() {
-  count_wifi_tx();
+  // ✅ 只有用户按按钮才算“发包/扣血”
+  count_user_action_packet();
 
-  // 读取按钮命令（你可以在这里接入电机控制）
   char c = 'S';
   if (server.hasArg("c") && server.arg("c").length() > 0) c = server.arg("c")[0];
 
-  // 如果 DEAD，强制 stop
-  if (run_flag == 0) c = 'S';
+  // DEAD 强制 stop（不管用户按啥）
+  if (run_flag == 0) {
+    stop_all_motors();
+    server.send(200, "text/plain", "DEAD");
+    return;
+  }
 
-  // TODO: 在这里根据 c 做前进/后退/转向/停止
-  // if(c=='F'){...} else if(c=='B'){...} ...
+  // TODO: 你在这里写真实动作（电机控制）
+  // 现在先回显命令，方便测试
+  // if(c=='F'){...} else if(c=='B'){...} else if(c=='L'){...} else if(c=='R'){...} else {stop...}
 
-  server.send(200, "text/plain", "OK");
+  server.send(200, "text/plain", String(c));
 }
 
 void handleNotFound() {
-  count_wifi_tx();
   server.send(404, "text/plain", "404");
 }
 
@@ -176,8 +173,8 @@ void setup() {
   Wire.begin(SDA_PIN, SCL_PIN, 40000);
 
   server.on("/", handleRoot);
-  server.on("/ping", handlePing);
   server.on("/cmd", handleCmd);
+  server.on("/status", handleStatus);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -185,6 +182,8 @@ void setup() {
   Serial.println("ESP32 I2C Master initialized (2 Hz).");
   Serial.printf("SDA: %d, SCL: %d\n", SDA_PIN, SCL_PIN);
   Serial.println("----------------------------------------");
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 }
 
 void loop() {
@@ -194,21 +193,18 @@ void loop() {
   if (currentMillis - previousMillis >= COMM_INTERVAL_MS) {
     previousMillis = currentMillis;
 
-    // 1) 取窗口计数 -> 作为 wifi 发送包数量(近似)
-    uint32_t pk = wifi_tx_count_window;
-    wifi_tx_count_window = 0;
+    // 只上报“用户操作次数”
+    uint32_t pk = wifi_packets_window;
+    wifi_packets_window = 0;
     uint8_t pk_byte = (pk > 255) ? 255 : (uint8_t)pk;
 
-    Serial.printf("WiFi TX(window): %lu -> sendByte: 0x%02X (%u)\n", pk, pk_byte, pk_byte);
+    Serial.printf("WiFi TX(window): %lu -> send: 0x%02X (%u)\n", pk, pk_byte, pk_byte);
 
-    // 2) 发给从机
     send_I2C_byte(pk_byte);
-
-    // 3) 收HP并更新run_flag
     receive_I2C_byte();
 
-    // 4) 打印 run_flag
     Serial.printf("-> RUN_FLAG: %d\n", run_flag);
     Serial.println("----------------------------------------");
   }
 }
+
