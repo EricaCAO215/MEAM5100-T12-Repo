@@ -1,0 +1,1060 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "vive510.h"
+#include <math.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h> // 引入 Adafruit 库
+
+// ======================================================
+// 0) MedianFilter (用于 Vive)
+// ======================================================
+const int     WINDOW_SIZE = 5;
+const float OUTLIER_THRESHOLD = 500.0f;
+
+class MedianFilter {
+  public:
+    uint16_t history[WINDOW_SIZE];
+    int head = 0;
+    int count = 0;
+
+    MedianFilter() {
+      for (int i=0;i<WINDOW_SIZE;i++) history[i] = 0;
+    }
+
+    void add(uint16_t v) {
+      history[head] = v;
+      head = (head + 1) % WINDOW_SIZE;
+      if (count < WINDOW_SIZE) count++;
+    }
+
+    uint16_t median() {
+      if (count == 0) return 0;
+      uint16_t tmp[WINDOW_SIZE];
+      for (int i=0;i<count;i++) tmp[i] = history[i];
+      for (int i=0;i<count-1;i++) {
+        for (int j=i+1;j<count;j++) {
+          if (tmp[j] < tmp[i]) {
+            uint16_t t = tmp[i]; tmp[i]=tmp[j]; tmp[j]=t;
+          }
+        }
+      }
+      return tmp[count/2];
+    }
+};
+
+static inline bool filterViveValue(uint16_t val, MedianFilter &f) {
+  if (f.count < 3) { f.add(val); return true; }
+  uint16_t med = f.median();
+  if (abs((long)val - (long)med) > OUTLIER_THRESHOLD) return false;
+  f.add(val);
+  return true;
+}
+
+// ===================== WiFi =====================
+const char *ssid      = "ESP32_Joystick_Car";
+const char *password = "12345678";
+WebServer server(80);
+
+// ===================== PID 参数 =====================
+#define INVERT_M1_ENCODER false
+#define INVERT_M2_ENCODER true
+
+float Kp1 = 3.0,  Ki1 = 0.0, Kd1 = 0.1;
+float Kp2 = 2.93, Ki2 = 0.0, Kd2 = 0.1;
+
+const float MAX_SPEED_RPM = 80.0;
+const float COUNTS_PER_REV = 4480.0;
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+const int SAMPLE_TIME_MS = 100;
+
+volatile float target_rpm_m1 = 0.0;
+volatile float target_rpm_m2 = 0.0;
+
+float current_rpm1 = 0;
+float current_rpm2 = 0;
+int pwm1 = 0;
+int pwm2 = 0;
+
+class SimplePID {
+  public:
+    float kp, ki, kd;
+    float integral = 0;
+    float prev_error = 0;
+
+    SimplePID(float p, float i, float d) : kp(p), ki(i), kd(d) {}
+
+    int compute(float target, float current, float dt) {
+      float error = target - current;
+      integral += error * dt;
+      integral = constrain(integral, -255.0f, 255.0f);
+      float derivative = (dt > 1e-6f) ? ((error - prev_error) / dt) : 0.0f;
+      prev_error = error;
+      float output = (kp * error) + (ki * integral) + (kd * derivative);
+      return (int)constrain(output, -255, 255);
+    }
+
+    void reset() { integral = 0; prev_error = 0; }
+};
+
+SimplePID pid1(Kp1, Ki1, Kd1);
+SimplePID pid2(Kp2, Ki2, Kd2);
+
+// ===================== 电机与编码器引脚 =====================
+const int M1_ENCODER_A_PIN = 7;
+const int M1_ENCODER_B_PIN = 3;
+const int M1_RPWM_PIN      = 33;
+const int M1_LPWM_PIN      = 38;
+
+const int M2_ENCODER_A_PIN = 18;
+const int M2_ENCODER_B_PIN = 14;
+const int M2_RPWM_PIN      = 6;
+const int M2_LPWM_PIN      = 5;
+
+volatile long M1_duration  = 0;
+volatile int  M1_encoder0PinALast = LOW;
+
+volatile long M2_duration  = 0;
+volatile int  M2_encoder0PinALast = LOW;
+
+// ===================== Vive（单 Vive + 滤波） =====================
+#define SIGNALPIN 12
+Vive510 vive(SIGNALPIN);
+
+uint16_t vive_x = 0, vive_y = 0;
+bool vive_valid = false;
+
+MedianFilter filterX;
+MedianFilter filterY;
+
+// 机器人位姿估计
+float robot_rx = 0.0f, robot_ry = 0.0f;
+float robot_theta_deg = 0.0f;
+bool  robot_pose_valid = false;
+
+float headingRad = 0.0f;
+bool heading_initialized = false;
+float last_rx = 0.0f, last_ry = 0.0f;
+
+// ===================== Go-To / Waypoints =====================
+float target_x = 0.0f, target_y = 0.0f;
+bool goto_active = false;
+
+const float GOTO_DIST_EPS   = 50.0f;
+const float GOTO_SLOW_DIST  = 400.0f;
+const float MIN_GOTO_SPEED  = 25.0f;
+const float KW              = 2.0f;
+
+const int   MAX_WP = 3;
+float wp_x[MAX_WP];
+float wp_y[MAX_WP];
+int   wp_count = 0;
+int   wp_idx   = 0;
+bool  wp_active = false;
+
+// ===================== Servo 攻击臂 =====================
+#define SERVO_PIN 1
+#define SERVO_FREQ_HZ     50
+#define SERVO_RES_BITS    10
+#define SERVO_MAX_DUTY    ((1 << SERVO_RES_BITS) - 1)
+
+// ⭐ 全局控制攻击状态的变量
+volatile bool attack_active = false;
+
+static inline uint32_t angleToDuty(int angle) {
+  float pulse_ms    = 0.5f + (angle / 180.0f) * 2.0f;
+  float duty_ratio = pulse_ms / 20.0f;
+  return (uint32_t)(duty_ratio * SERVO_MAX_DUTY);
+}
+
+static inline void servoSweepTask() {
+  // ⭐ 只有 attack_active 为 true 时才扫动
+  if (!attack_active) {
+    ledcWrite(SERVO_PIN, angleToDuty(20)); // 停止时设为起始角度 (20度)
+    return;
+  }
+
+  static int a = 20;
+  static int dir = +1;
+  static unsigned long last = 0;
+  if (millis() - last < 15) return;
+  last = millis();
+
+  ledcWrite(SERVO_PIN, angleToDuty(a));
+  a += dir * 3;
+  if (a >= 120) { a = 120; dir = -1; }
+  if (a <= 20)  { a = 20;  dir = +1; }
+}
+
+// ===================== TopHat I2C（血量）=====================
+// ✅ 用你提供的 TopHat 逻辑替换这里（其余不动）
+// 注意：为了不和 ToF 的 Wire 冲突，这里仍使用 Wire1，但打印/逻辑完全按你那份代码
+#define I2C_SLAVE_ADDR      0x28
+#define SDA_PIN_TOPHAT      43
+#define SCL_PIN_TOPHAT      44
+#define COMM_INTERVAL_MS    500   // 2 Hz
+
+volatile int run_flag = 1;
+unsigned long previousMillis = 0;
+
+// 只有用户按按钮/触发cmd才算“扣血包”
+volatile uint32_t wifi_packets_window = 0;
+
+static inline void count_user_action_packet() {
+  wifi_packets_window++;
+}
+
+// ===================== Wall Follow（Dual ToF + 状态机） =====================
+// 使用 Wire 对象
+#define MY_SDA 8
+#define MY_SCL 9
+
+#define XSHUT_FRONT 11
+#define XSHUT_SIDE  10
+
+#define ADDR_FRONT 0x2A
+#define ADDR_SIDE  0x2B
+
+// 使用 Adafruit 库对象
+Adafruit_VL53L0X tofFront = Adafruit_VL53L0X();
+Adafruit_VL53L0X tofSide = Adafruit_VL53L0X();
+
+float val_front = -1.0f;
+float val_side  = -1.0f;
+bool  obs_front = false;
+
+// ====== ToF 非阻塞状态变量 ======
+enum ToFState {
+    TOF_IDLE,
+    TOF_START_FRONT,
+    TOF_WAIT_FRONT,
+    TOF_START_SIDE,
+    TOF_WAIT_SIDE
+};
+static ToFState tof_state = TOF_IDLE;
+
+#define NAV_STATE_STOP         0
+#define NAV_STATE_FORWARD      1
+#define NAV_STATE_TURNING      2
+#define NAV_STATE_WALL_FOLLOW  3
+
+int nav_state = NAV_STATE_STOP;
+
+const float AUTO_FORWARD_RPM        = 70.0f;
+// **前向障碍物阈值 20.0 cm**
+const float OBSTACLE_THRESHOLD_CM   = 20.0f;
+const float WALL_TARGET_DISTANCE_CM = 12.0f;
+const float WALL_FOLLOW_KP          = 2.0f;
+const float TURN_SPEED_RPM          = 30.0f;
+const unsigned long TURN_DURATION_MS = 1000;
+
+unsigned long turn_start_time = 0;
+
+static inline float clampSpeed(float rpm) {
+  return constrain(rpm, -MAX_SPEED_RPM, MAX_SPEED_RPM);
+}
+
+// ===================== Stop / Goto / Waypoints helper =====================
+static inline void hardStopNow() {
+  goto_active = false;
+  wp_active = false;
+  nav_state = NAV_STATE_STOP;
+
+  target_rpm_m1 = 0.0f;
+  target_rpm_m2 = 0.0f;
+  pid1.reset();
+  pid2.reset();
+
+  ledcWrite(M1_LPWM_PIN, 0);
+  ledcWrite(M1_RPWM_PIN, 0);
+  ledcWrite(M2_LPWM_PIN, 0);
+  ledcWrite(M2_RPWM_PIN, 0);
+}
+
+static inline void stop_all_motors() {
+  hardStopNow();
+}
+
+static inline void startSingleGoto(float x, float y) {
+  nav_state = NAV_STATE_STOP;
+  wp_active = false;
+  wp_count = 0;
+  wp_idx = 0;
+  target_x = x;
+  target_y = y;
+  goto_active = true;
+}
+
+static inline void startWaypointRun() {
+  if (wp_count <= 0) return;
+  nav_state = NAV_STATE_STOP;
+  wp_idx = 0;
+  wp_active = true;
+  target_x = wp_x[0];
+  target_y = wp_y[0];
+  goto_active = true;
+}
+
+static inline void advanceWaypoint() {
+  wp_idx++;
+  if (wp_idx >= wp_count) {
+    hardStopNow();
+    return;
+  }
+  target_x = wp_x[wp_idx];
+  target_y = wp_y[wp_idx];
+  goto_active = true;
+}
+
+// ===================== Encoder ISRs =====================
+void IRAM_ATTR wheelSpeed_M1() {
+  int Lstate = digitalRead(M1_ENCODER_A_PIN);
+  if (Lstate != M1_encoder0PinALast) {
+    int val = digitalRead(M1_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M1_ENCODER) dir = !dir;
+    if (dir) M1_duration++; else M1_duration--;
+  }
+  M1_encoder0PinALast = Lstate;
+}
+
+void IRAM_ATTR wheelSpeed_M2() {
+  int Lstate = digitalRead(M2_ENCODER_A_PIN);
+  if (Lstate != M2_encoder0PinALast) {
+    int val = digitalRead(M2_ENCODER_B_PIN);
+    bool dir = (val != Lstate);
+    if (INVERT_M2_ENCODER) dir = !dir;
+    if (dir) M2_duration++; else M2_duration--;
+  }
+  M2_encoder0PinALast = Lstate;
+}
+
+// ===================== Motor PWM =====================
+static inline void set_motor_pwm(int rpwm_pin, int lpwm_pin, int pwm_val) {
+  if (pwm_val > 0) {
+    ledcWrite(lpwm_pin, 0);
+    ledcWrite(rpwm_pin, pwm_val);
+  } else {
+    ledcWrite(lpwm_pin, abs(pwm_val));
+    ledcWrite(rpwm_pin, 0);
+  }
+}
+
+// ===================== Vive update =====================
+static inline void updateVive() {
+  if (vive.status() == VIVE_RECEIVING) {
+    uint16_t x_raw = vive.xCoord();
+    uint16_t y_raw = vive.yCoord();
+
+    bool range_ok = (x_raw > 1000 && x_raw < 8000 &&
+                     y_raw > 1000 && y_raw < 8000);
+
+    if (range_ok) {
+      bool okx = filterViveValue(x_raw, filterX);
+      bool oky = filterViveValue(y_raw, filterY);
+
+      if (okx && oky) {
+        vive_x = filterX.median();
+        vive_y = filterY.median();
+        vive_valid = true;
+        return;
+      }
+    }
+    vive_valid = false;
+  } else {
+    vive_valid = false;
+    vive.sync(5);
+  }
+}
+
+// ===================== ToF read (Adafruit 非阻塞修正版) =====================
+static inline void updateToF_NonBlocking() {
+    static unsigned long last_tof_cycle_time = 0;
+    unsigned long now = millis();
+    const unsigned long TOF_CYCLE_INTERVAL = 50;
+
+    uint16_t dist_mm;
+
+    if (tof_state == TOF_WAIT_FRONT && tofFront.isRangeComplete()) {
+        goto complete_front;
+    }
+    if (tof_state == TOF_WAIT_SIDE && tofSide.isRangeComplete()) {
+        goto complete_side;
+    }
+
+    if (now - last_tof_cycle_time < TOF_CYCLE_INTERVAL) {
+        return;
+    }
+    last_tof_cycle_time = now;
+
+    switch (tof_state) {
+        case TOF_IDLE:
+        case TOF_START_FRONT:
+            tofFront.startRange();
+            tof_state = TOF_WAIT_FRONT;
+            break;
+
+        case TOF_WAIT_FRONT:
+            if (tofFront.isRangeComplete()) {
+                complete_front:
+                dist_mm = tofFront.readRange();
+
+                if (dist_mm > 50 && dist_mm < 8000) val_front = dist_mm / 10.0f;
+                else val_front = -1.0f;
+
+                tof_state = TOF_START_SIDE;
+            }
+            break;
+
+        case TOF_START_SIDE:
+            tofSide.startRange();
+            tof_state = TOF_WAIT_SIDE;
+            break;
+
+        case TOF_WAIT_SIDE:
+            if (tofSide.isRangeComplete()) {
+                complete_side:
+                dist_mm = tofSide.readRange();
+
+                if (dist_mm > 50 && dist_mm < 8000) val_side = dist_mm / 10.0f;
+                else val_side = -1.0f;
+
+                tof_state = TOF_START_FRONT;
+            }
+            break;
+    }
+
+    obs_front = (val_front > 0 && val_front < OBSTACLE_THRESHOLD_CM);
+}
+
+// ===================== Wall Follow navigation =====================
+static inline void runNavigationLogic() {
+  bool frontal_blockage = (val_front > 0 && val_front < OBSTACLE_THRESHOLD_CM);
+  float base_speed = min(AUTO_FORWARD_RPM, MAX_SPEED_RPM);
+
+  switch (nav_state) {
+    case NAV_STATE_FORWARD:
+      if (frontal_blockage) {
+        nav_state = NAV_STATE_TURNING;
+        turn_start_time = millis();
+        target_rpm_m1 = -TURN_SPEED_RPM;
+        target_rpm_m2 =  TURN_SPEED_RPM;
+        pid1.reset();
+        pid2.reset();
+      } else {
+        nav_state = NAV_STATE_WALL_FOLLOW;
+      }
+      break;
+
+    case NAV_STATE_WALL_FOLLOW:
+      if (frontal_blockage) {
+        nav_state = NAV_STATE_TURNING;
+        turn_start_time = millis();
+        target_rpm_m1 = -TURN_SPEED_RPM;
+        target_rpm_m2 =  TURN_SPEED_RPM;
+        pid1.reset();
+        pid2.reset();
+      } else {
+        if (val_side > 0) {
+            float wall_error = WALL_TARGET_DISTANCE_CM - val_side;
+            float steer_command = wall_error * WALL_FOLLOW_KP;
+            steer_command = constrain(steer_command, -TURN_SPEED_RPM, TURN_SPEED_RPM);
+
+            float l = base_speed - steer_command;
+            float r = base_speed + steer_command;
+
+            target_rpm_m1 = clampSpeed(l);
+            target_rpm_m2 = clampSpeed(r);
+        } else {
+            target_rpm_m1 = base_speed;
+            target_rpm_m2 = base_speed;
+        }
+      }
+      break;
+
+    case NAV_STATE_TURNING:
+      if (millis() - turn_start_time >= TURN_DURATION_MS) {
+        nav_state = NAV_STATE_WALL_FOLLOW;
+        pid1.reset();
+        pid2.reset();
+      }
+      break;
+
+    case NAV_STATE_STOP:
+    default:
+      target_rpm_m1 = 0.0f;
+      target_rpm_m2 = 0.0f;
+      break;
+  }
+}
+
+// ===================== TopHat I2C funcs (按你提供的串口风格) =====================
+static inline void send_I2C_byte(uint8_t data) {
+  Wire1.beginTransmission(I2C_SLAVE_ADDR);
+  Wire1.write(data);
+  uint8_t error = Wire1.endTransmission();
+
+  if (error == 0) {
+    Serial.printf("[%lu ms] SUCCESS: Data sent.\n", millis());
+  } else {
+    Serial.printf("[%lu ms] ERROR %d: Failed to send data to Top Hat (No ACK).\n", millis(), error);
+  }
+}
+
+static inline uint8_t receive_I2C_byte() {
+  uint8_t bytesReceived = Wire1.requestFrom(I2C_SLAVE_ADDR, (uint8_t)1);
+  uint8_t current_health_hp = 0;
+
+  if (bytesReceived > 0) {
+    while (Wire1.available()) {
+      current_health_hp = Wire1.read();
+    }
+    Serial.printf("Received HP: 0x%02X (%d HP) ", current_health_hp, current_health_hp);
+
+    if (current_health_hp == 0x00) {
+      if (run_flag != 0) Serial.println("-> STATUS: DEAD");
+      run_flag = 0;
+      stop_all_motors();
+    } else {
+      if (run_flag != 1) Serial.println("-> STATUS: ALIVE");
+      run_flag = 1;
+    }
+  } else {
+    Serial.println("WARNING: Failed to receive health status (0 bytes received).");
+    return 0;
+  }
+  return current_health_hp;
+}
+
+// ===================== Web page（完整） =====================
+const char index_html[] PROGMEM = R"rawliteral(
+<!doctype html><html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta charset="utf-8">
+<title>ESP32 Control</title>
+<style>
+  body{font-family:Arial,'Microsoft YaHei';text-align:center;margin:0;padding:12px;touch-action:none}
+  h2{margin:8px 0}
+  .grid{display:grid;grid-template-columns:repeat(3,90px);grid-gap:10px;justify-content:center;margin-top:14px}
+  button{height:54px;font-size:16px;border:none;border-radius:10px;background:#007bff;color:white}
+  button.gray{background:#444}
+  button.green{background:#2ecc71}
+  button.red{background:#e74c3c}
+  .info{margin-top:12px;font-family:monospace}
+  .box{margin-top:12px;font-size:14px}
+  .box input{width:70px;padding:4px;margin:2px}
+  .box button{height:auto;padding:8px 10px;font-size:14px}
+  .row{display:flex;justify-content:center;gap:10px;flex-wrap:wrap}
+  .card{min-width:150px;border-radius:12px;padding:10px;background:#f5f5f5}
+</style>
+</head>
+<body>
+<h2>⬆⬇⬅➡ 手动 + Vive GOTO/WP + WallFollow + TopHat</h2>
+
+<div class="row">
+  <div class="card">RUN_FLAG: <span id="rf">-</span></div>
+  <div class="card">NAV: <span id="ns">0</span></div>
+</div>
+
+<div class="row" style="margin-top:10px;">
+  <div class="card">ToF Front(cm): <span id="tf">--</span></div>
+  <div class="card">ToF Side(cm): <span id="ts">--</span></div>
+</div>
+
+<div class="grid">
+  <div></div>
+  <button onmousedown="send('F')" ontouchstart="send('F')" onmouseup="send('S')" ontouchend="send('S')">↑</button>
+  <div></div>
+
+  <button onmousedown="send('L')" ontouchstart="send('L')" onmouseup="send('S')" ontouchend="send('S')">←</button>
+  <button class="gray" onclick="send('S')">■</button>
+  <button onmousedown="send('R')" ontouchstart="send('R')" ontoumouseup="send('S')" ontouchend="send('S')">→</button>
+
+  <div></div>
+  <button onmousedown="send('B')" ontouchstart="send('B')" onmouseup="send('S')" ontouchend="send('S')">↓</button>
+  <div></div>
+</div>
+
+<div class="box">
+  <button class="green" onclick="xhrGET('/auto_start')">AUTO WALL FOLLOW</button>
+  <button class="red"    onclick="xhrGET('/auto_stop')">STOP AUTO</button>
+</div>
+
+<div class="box" style="margin-top: 15px;">
+  <button class="red" style="width: 140px; margin: 4px;" onclick="xhrGET('/attack_start')">开始攻击</button>
+  <button class="gray" style="width: 140px; margin: 4px;" onclick="xhrGET('/attack_stop')">停止攻击</button>
+</div>
+
+<div class="info">
+  <div>RPM L/R: <span id="rpm1">0</span> / <span id="rpm2">0</span></div>
+  <div>Vive: (<span id="v1x">0</span>, <span id="v1y">0</span>)</div>
+  <div>Pose: X=<span id="rx">0</span>, Y=<span id="ry">0</span>, θ=<span id="th">0</span>°</div>
+</div>
+
+<div class="box">
+  <div><b>Go to (X,Y)</b></div>
+  <input id="tx" type="number" placeholder="X">
+  <input id="ty" type="number" placeholder="Y">
+  <button onclick="sendGoto()">Go</button>
+  <button class="gray" onclick="sendStop()">Stop</button>
+</div>
+
+<div class="box">
+  <div><b>Waypoints (最多 3 个，顺序执行)</b></div>
+  <div><input id="w1x" type="number" placeholder="X1"><input id="w1y" type="number" placeholder="Y1"></div>
+  <div><input id="w2x" type="number" placeholder="X2"><input id="w2y" type="number" placeholder="Y2"></div>
+  <div><input id="w3x" type="number" placeholder="X3"><input id="w3y" type="number" placeholder="Y3"></div>
+  <button onclick="sendWaypoints()">Start Waypoints</button>
+  <button class="gray" onclick="clearWaypoints()">Clear</button>
+</div>
+
+<script>
+function xhrGET(url){
+  var xhr=new XMLHttpRequest();
+  xhr.open("GET",url,true);
+  xhr.send();
+}
+function send(c){ xhrGET("/cmd?c="+c); }
+function sendStop(){ xhrGET("/stop"); }
+
+function sendGoto(){
+  var tx=document.getElementById("tx").value;
+  var ty=document.getElementById("ty").value;
+  if(tx===""||ty==="") return;
+  xhrGET("/goto?x="+tx+"&y="+ty);
+}
+function sendWaypoints(){
+  var w=[];
+  function add(ix,iy){
+    var x=document.getElementById(ix).value;
+    var y=document.getElementById(iy).value;
+    if(x!==""&&y!=="") w.push(x+","+y);
+  }
+  add("w1x","w1y"); add("w2x","w2y"); add("w3x","w3y");
+  if(w.length===0) return;
+  xhrGET("/waypoints?pts="+encodeURIComponent(w.join(";")));
+}
+function clearWaypoints(){ xhrGET("/clearwp"); }
+
+// 键盘方向键：按下发 F/B/L/R，松开发 S
+var keyDown = {};
+document.addEventListener('keydown', function(e){
+  if(keyDown[e.code]) return;
+  keyDown[e.code]=true;
+  if(e.code==="ArrowUp") send('F');
+  else if(e.code==="ArrowDown") send('B');
+  else if(e.code==="ArrowLeft") send('L');
+  else if(e.code==="ArrowRight") send('R');
+});
+document.addEventListener('keyup', function(e){
+  keyDown[e.code]=false;
+  if(e.code==="ArrowUp"||e.code==="ArrowDown"||e.code==="ArrowLeft"||e.code==="ArrowRight") send('S');
+});
+
+setInterval(function(){
+  var xhr=new XMLHttpRequest();
+  xhr.onreadystatechange=function(){
+    if(this.readyState==4 && this.status==200){
+      var j=JSON.parse(this.responseText);
+      document.getElementById("rf").innerText=j.run;
+      document.getElementById("ns").innerText=j.nav;
+      document.getElementById("tf").innerText=j.tf.toFixed(1);
+      document.getElementById("ts").innerText=j.ts.toFixed(1);
+      document.getElementById("rpm1").innerText=j.m1.toFixed(1);
+      document.getElementById("rpm2").innerText=j.m2.toFixed(1);
+      document.getElementById("v1x").innerText=j.v1x;
+      document.getElementById("v1y").innerText=j.v1y;
+      document.getElementById("rx").innerText=j.rx.toFixed(1);
+      document.getElementById("ry").innerText=j.ry.toFixed(1);
+      document.getElementById("th").innerText=j.th.toFixed(1);
+    }
+  };
+  xhr.open("GET","/data",true);
+  xhr.send();
+},200);
+</script>
+</body></html>
+)rawliteral";
+
+// ===================== Web handlers =====================
+static inline void handleRoot() {
+  server.send(200, "text/html; charset=utf-8", index_html);
+}
+
+static inline void handleCmd() {
+  count_user_action_packet();
+
+  char c = 'S';
+  if (server.hasArg("c") && server.arg("c").length() > 0) c = server.arg("c")[0];
+
+  if (run_flag == 0) {
+    stop_all_motors();
+    server.send(200, "text/plain", "DEAD");
+    return;
+  }
+
+  goto_active = false;
+  wp_active = false;
+  nav_state = NAV_STATE_STOP;
+
+  float L = 0.0f, R = 0.0f;
+  if (c == 'F') { L =  MAX_SPEED_RPM; R =  MAX_SPEED_RPM; }
+  else if (c == 'B') { L = -MAX_SPEED_RPM; R = -MAX_SPEED_RPM; }
+  else if (c == 'L') { L = -MAX_SPEED_RPM; R =  MAX_SPEED_RPM; }
+  else if (c == 'R') { L =  MAX_SPEED_RPM; R = -MAX_SPEED_RPM; }
+  else { L = 0.0f; R = 0.0f; pid1.reset(); pid2.reset(); }
+
+  target_rpm_m1 = L;
+  target_rpm_m2 = R;
+
+  server.send(200, "text/plain", String(c));
+}
+
+static inline void handleGoto() {
+  count_user_action_packet();
+  if (run_flag == 0) { stop_all_motors(); server.send(200, "text/plain", "DEAD"); return; }
+
+  if (server.hasArg("x") && server.hasArg("y")) {
+    float x = server.arg("x").toFloat();
+    float y = server.arg("y").toFloat();
+    startSingleGoto(x, y);
+    server.send(200, "text/plain", "GOTO SET");
+  } else {
+    server.send(400, "text/plain", "Missing x/y");
+  }
+}
+
+static inline void handleStop() {
+  count_user_action_packet();
+  hardStopNow();
+  server.send(200, "text/plain", "STOP");
+}
+
+static inline void handleWaypoints() {
+  count_user_action_packet();
+  if (run_flag == 0) { stop_all_motors(); server.send(200, "text/plain", "DEAD"); return; }
+
+  if (!server.hasArg("pts")) { server.send(400, "text/plain", "Missing pts"); return; }
+
+  String pts = server.arg("pts");
+  pts.trim();
+  if (pts.length() == 0) { server.send(400, "text/plain", "Empty pts"); return; }
+
+  wp_count = 0; wp_idx = 0; wp_active = false;
+
+  int start = 0;
+  while (wp_count < MAX_WP) {
+    int sep = pts.indexOf(';', start);
+    String one = (sep >= 0) ? pts.substring(start, sep) : pts.substring(start);
+    one.trim();
+    if (one.length() > 0) {
+      int comma = one.indexOf(',');
+      if (comma > 0) {
+        wp_x[wp_count] = one.substring(0, comma).toFloat();
+        wp_y[wp_count] = one.substring(comma + 1).toFloat();
+        wp_count++;
+      }
+    }
+    if (sep < 0) break;
+    start = sep + 1;
+  }
+
+  if (wp_count <= 0) { server.send(400, "text/plain", "No valid waypoints"); return; }
+
+  startWaypointRun();
+  server.send(200, "text/plain", "WAYPOINTS START");
+}
+
+static inline void handleClearWP() {
+  count_user_action_packet();
+  wp_count = 0; wp_idx = 0; wp_active = false;
+  server.send(200, "text/plain", "WAYPOINTS CLEARED");
+}
+
+static inline void handleAutoStart() {
+  count_user_action_packet();
+  if (run_flag == 0) { stop_all_motors(); server.send(200, "text/plain", "DEAD"); return; }
+
+  goto_active = false;
+  wp_active = false;
+
+  if (nav_state == NAV_STATE_STOP) {
+    nav_state = NAV_STATE_FORWARD;
+    pid1.reset();
+    pid2.reset();
+  }
+  server.send(200, "text/plain", "Auto Mode Started");
+}
+
+static inline void handleAutoStop() {
+  count_user_action_packet();
+  nav_state = NAV_STATE_STOP;
+  target_rpm_m1 = 0.0f;
+  target_rpm_m2 = 0.0f;
+  pid1.reset();
+  pid2.reset();
+  server.send(200, "text/plain", "Auto Mode Stopped");
+}
+
+// ⭐ 新增：舵机攻击开始
+static inline void handleAttackStart() {
+  attack_active = true;
+  server.send(200, "text/plain", "ATTACK STARTED");
+}
+
+// ⭐ 新增：舵机攻击停止
+static inline void handleAttackStop() {
+  attack_active = false;
+  ledcWrite(SERVO_PIN, angleToDuty(20));
+  server.send(200, "text/plain", "ATTACK STOPPED");
+}
+
+static inline void handleData() {
+  String json = "{";
+  json += "\"run\":" + String(run_flag);
+  json += ",\"nav\":" + String(nav_state);
+  json += ",\"tf\":"  + String(val_front);
+  json += ",\"ts\":"  + String(val_side);
+  json += ",\"m1\":"  + String(current_rpm1);
+  json += ",\"m2\":"  + String(current_rpm2);
+  json += ",\"v1x\":" + String(vive_x);
+  json += ",\"v1y\":" + String(vive_y);
+  json += ",\"rx\":"  + String(robot_rx, 1);
+  json += ",\"ry\":"  + String(robot_ry, 1);
+  json += ",\"th\":"  + String(robot_theta_deg, 1);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+// ===================== Setup =====================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // --- WiFi Setup ---
+  WiFi.mode(WIFI_AP);
+  int wifi_channel = 6;
+  bool success = WiFi.softAP(ssid, password, wifi_channel);
+
+  if (success) {
+      Serial.print("AP IP: ");
+      Serial.println(WiFi.softAPIP());
+      Serial.print("WiFi Channel Set: ");
+      Serial.println(WiFi.channel());
+  } else {
+      Serial.println("❌ WiFi AP 启动失败！请检查引脚冲突或电源。");
+  }
+
+  server.on("/",           handleRoot);
+  server.on("/cmd",        handleCmd);
+  server.on("/data",       handleData);
+  server.on("/goto",       handleGoto);
+  server.on("/stop",       handleStop);
+  server.on("/waypoints",  handleWaypoints);
+  server.on("/clearwp",    handleClearWP);
+  server.on("/auto_start", handleAutoStart);
+  server.on("/auto_stop",  handleAutoStop);
+  server.on("/attack_start", handleAttackStart);
+  server.on("/attack_stop",  handleAttackStop);
+  server.begin();
+
+  // --- Encoder Setup ---
+  pinMode(M1_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M1_ENCODER_B_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_A_PIN, INPUT_PULLUP);
+  pinMode(M2_ENCODER_B_PIN, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(M1_ENCODER_A_PIN), wheelSpeed_M1, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(M2_ENCODER_A_PIN), wheelSpeed_M2, CHANGE);
+
+  // --- Motor PWM Setup ---
+  ledcAttach(M1_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M1_LPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_RPWM_PIN, PWM_FREQ, PWM_RES);
+  ledcAttach(M2_LPWM_PIN, PWM_FREQ, PWM_RES);
+
+  // --- Servo Setup ---
+  pinMode(SERVO_PIN, OUTPUT);
+  ledcAttach(SERVO_PIN, SERVO_FREQ_HZ, SERVO_RES_BITS);
+
+  // --- Vive Setup ---
+  vive.begin();
+
+  // --- TopHat I2C on Wire1 ---
+  Wire1.begin(SDA_PIN_TOPHAT, SCL_PIN_TOPHAT, 40000);
+
+  Serial.println("----------------------------------------");
+  Serial.println("ESP32 I2C Master initialized (2 Hz).");
+  Serial.printf("SDA: %d, SCL: %d\n", SDA_PIN_TOPHAT, SCL_PIN_TOPHAT);
+  Serial.println("----------------------------------------");
+
+  // --- ToF I2C on Wire ---
+  Wire.begin(MY_SDA, MY_SCL);
+  Wire.setClock(100000);
+
+  pinMode(XSHUT_FRONT, OUTPUT);
+  pinMode(XSHUT_SIDE,  OUTPUT);
+
+  // 1. 重置所有 ToF
+  digitalWrite(XSHUT_FRONT, LOW);
+  digitalWrite(XSHUT_SIDE,  LOW);
+  delay(100);
+
+  // 2. 初始化正面 ToF
+  digitalWrite(XSHUT_FRONT, HIGH);
+  delay(120);
+  if (!tofFront.begin()) {
+    Serial.println("WARNING: Failed to detect and initialize FRONT ToF! Continuing...");
+  } else {
+    tofFront.setAddress(ADDR_FRONT);
+    tofFront.setMeasurementTimingBudgetMicroSeconds(50000);
+    Serial.print("Front ToF initialized at 0x");
+    Serial.println(ADDR_FRONT, HEX);
+  }
+
+  // 3. 初始化侧面 ToF
+  digitalWrite(XSHUT_SIDE, HIGH);
+  delay(120);
+  if (!tofSide.begin()) {
+    Serial.println("WARNING: Failed to detect and initialize SIDE ToF! Continuing...");
+  } else {
+    tofSide.setAddress(ADDR_SIDE);
+    tofSide.setMeasurementTimingBudgetMicroSeconds(50000);
+    Serial.print("Side ToF initialized at 0x");
+    Serial.println(ADDR_SIDE, HEX);
+  }
+
+  // 启动第一个 ToF 测量周期
+  tof_state = TOF_START_FRONT;
+}
+
+// ===================== Loop =====================
+void loop() {
+  server.handleClient();
+
+  updateToF_NonBlocking();
+
+  servoSweepTask();
+
+  unsigned long now = millis();
+  static unsigned long last_motor_time = 0;
+  static unsigned long last_vive_time  = 0;
+
+  const unsigned long VIVE_UPDATE_INTERVAL_MS = 50;
+  const unsigned long VIVE_SYNC_RETRY_MS = 2000;
+
+  unsigned long interval = VIVE_UPDATE_INTERVAL_MS;
+  if (!vive_valid) {
+      interval = VIVE_SYNC_RETRY_MS;
+  }
+
+  if (now - last_vive_time >= interval) {
+    updateVive();
+
+    if (vive_valid) {
+      robot_rx = vive_x;
+      robot_ry = vive_y;
+
+      if (!heading_initialized) {
+        last_rx = robot_rx;
+        last_ry = robot_ry;
+        heading_initialized = true;
+      } else {
+        float dx = robot_rx - last_rx;
+        float dy = robot_ry - last_ry;
+        float dist_move = sqrtf(dx*dx + dy*dy);
+        if (dist_move > 3.0f) {
+          float new_heading = atan2f(dy, dx);
+          headingRad = 0.6f * headingRad + 0.4f * new_heading;
+          last_rx = robot_rx;
+          last_ry = robot_ry;
+        }
+      }
+
+      robot_theta_deg = headingRad * 180.0f / PI;
+      robot_pose_valid = true;
+    } else {
+      robot_pose_valid = false;
+    }
+
+    last_vive_time = now;
+  }
+
+  if (run_flag == 1 && nav_state != NAV_STATE_STOP) {
+    runNavigationLogic();
+  }
+
+  if (run_flag == 1 && nav_state == NAV_STATE_STOP && goto_active && robot_pose_valid) {
+    float dx = target_x - robot_rx;
+    float dy = target_y - robot_ry;
+    float dist = sqrtf(dx*dx + dy*dy);
+
+    if (dist < GOTO_DIST_EPS) {
+      if (wp_active) advanceWaypoint();
+      else { hardStopNow(); }
+    } else {
+      float desired_heading = atan2f(dy, dx);
+      float err = desired_heading - headingRad;
+      while (err >  PI) err -= 2.0f * PI;
+      while (err < -PI) err += 2.0f * PI;
+
+      float v = (dist > GOTO_SLOW_DIST) ? MAX_SPEED_RPM
+               : (MIN_GOTO_SPEED + (MAX_SPEED_RPM - MIN_GOTO_SPEED) * (dist / GOTO_SLOW_DIST));
+
+      float omega = KW * err * (MAX_SPEED_RPM / PI);
+      float maxOmega = 0.7f * MAX_SPEED_RPM;
+      if (omega >  maxOmega) omega =  maxOmega;
+      if (omega < -maxOmega) omega = -maxOmega;
+
+      float left_rpm  = constrain(v - omega, -MAX_SPEED_RPM, MAX_SPEED_RPM);
+      float right_rpm = constrain(v + omega, -MAX_SPEED_RPM, MAX_SPEED_RPM);
+
+      target_rpm_m1 = left_rpm;
+      target_rpm_m2 = right_rpm;
+    }
+  }
+
+  if (now - last_motor_time >= (unsigned long)SAMPLE_TIME_MS) {
+    float dt = (now - last_motor_time) / 1000.0f;
+
+    noInterrupts();
+    long p1 = M1_duration; M1_duration = 0;
+    long p2 = M2_duration; M2_duration = 0;
+    interrupts();
+
+    current_rpm1 = (p1 / COUNTS_PER_REV) * 60.0f / dt;
+    current_rpm2 = (p2 / COUNTS_PER_REV) * 60.0f / dt;
+
+    if (run_flag == 0) {
+      pwm1 = 0; pwm2 = 0;
+      pid1.reset(); pid2.reset();
+    } else {
+      pwm1 = (abs(target_rpm_m1) > 0.1f) ? pid1.compute(target_rpm_m1, current_rpm1, dt) : 0;
+      pwm2 = (abs(target_rpm_m2) > 0.1f) ? pid2.compute(target_rpm_m2, current_rpm2, dt) : 0;
+    }
+
+    set_motor_pwm(M1_RPWM_PIN, M1_LPWM_PIN, pwm1);
+    set_motor_pwm(M2_RPWM_PIN, M2_LPWM_PIN, pwm2);
+
+    last_motor_time = now;
+  }
+
+  // I2C TopHat 通信 (500ms)
+  if (now - previousMillis >= COMM_INTERVAL_MS) {
+    previousMillis = now;
+
+    uint32_t pk = wifi_packets_window;
+    wifi_packets_window = 0;
+    uint8_t pk_byte = (pk > 255) ? 255 : (uint8_t)pk;
+
+    Serial.printf("WiFi TX(window): %lu -> send: 0x%02X (%u)\n", pk, pk_byte, pk_byte);
+
+    send_I2C_byte(pk_byte);
+    receive_I2C_byte();
+
+    Serial.printf("-> RUN_FLAG: %d\n", run_flag);
+    Serial.println("----------------------------------------");
+  }
+}
